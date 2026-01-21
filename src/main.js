@@ -34,7 +34,30 @@ function formatStopwatch(ms) {
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(centis).padStart(2, '0')}`;
 }
 
-function setupStopwatch() {
+const STOPWATCH_STORAGE_KEY = 'todo_app_stopwatch_state_v1';
+
+function loadLocalStopwatch() {
+    try {
+        const raw = localStorage.getItem(STOPWATCH_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        if (!parsed) return null;
+        const elapsed_ms = Number(parsed.elapsed_ms ?? 0);
+        const lap_totals_ms = Array.isArray(parsed.lap_totals_ms) ? parsed.lap_totals_ms.map(Number) : [];
+        return { elapsed_ms: Math.max(0, elapsed_ms), lap_totals_ms: lap_totals_ms.filter((n) => Number.isFinite(n) && n >= 0) };
+    } catch {
+        return null;
+    }
+}
+
+function saveLocalStopwatch(state) {
+    try {
+        localStorage.setItem(STOPWATCH_STORAGE_KEY, JSON.stringify(state));
+    } catch {
+        // ignore
+    }
+}
+
+async function setupStopwatch() {
     const toggleBtn = $('toggle-stopwatch');
     const panel = $('stopwatch-panel');
     const timeEl = $('stopwatch-time');
@@ -111,6 +134,18 @@ function setupStopwatch() {
         }
     };
 
+    const persistStopwatch = async () => {
+        const snapshot = { elapsed_ms: getCurrentMs(), lap_totals_ms: lapTotals.slice() };
+        await invokeOrFallback(
+            'set_stopwatch_state',
+            { stopwatch: snapshot },
+            async () => {
+                saveLocalStopwatch(snapshot);
+                return snapshot;
+            },
+        );
+    };
+
     const stop = () => {
         if (!running) return;
         running = false;
@@ -122,6 +157,7 @@ function setupStopwatch() {
         setStatus('paused');
         lapBtn.disabled = getCurrentMs() <= 0;
         render();
+        persistStopwatch().catch((e) => console.error(e));
     };
 
     const start = () => {
@@ -147,11 +183,20 @@ function setupStopwatch() {
         lapBtn.disabled = true;
         render();
         renderLaps();
+        invokeOrFallback(
+            'clear_stopwatch_state',
+            {},
+            async () => {
+                localStorage.removeItem(STOPWATCH_STORAGE_KEY);
+                return true;
+            },
+        ).catch((e) => console.error(e));
     };
 
     const clearLaps = () => {
         lapTotals = [];
         renderLaps();
+        persistStopwatch().catch((e) => console.error(e));
     };
 
     const deleteLap = (index) => {
@@ -160,6 +205,7 @@ function setupStopwatch() {
         if (i < 0 || i >= lapTotals.length) return;
         lapTotals = lapTotals.filter((_, idx) => idx !== i);
         renderLaps();
+        persistStopwatch().catch((e) => console.error(e));
     };
 
     const lap = () => {
@@ -167,6 +213,7 @@ function setupStopwatch() {
         if (current <= 0) return;
         lapTotals.push(current);
         renderLaps();
+        persistStopwatch().catch((e) => console.error(e));
     };
 
     toggleBtn.addEventListener('click', () => {
@@ -195,6 +242,23 @@ function setupStopwatch() {
     render();
     renderLaps();
     lapBtn.disabled = true;
+
+    // 초기 로드(tauri 우선)
+    const loaded = await invokeOrFallback(
+        'get_stopwatch_state',
+        {},
+        async () => loadLocalStopwatch(),
+    );
+    if (loaded && typeof loaded === 'object') {
+        elapsed = Number(loaded.elapsed_ms ?? 0) || 0;
+        lapTotals = Array.isArray(loaded.lap_totals_ms) ? loaded.lap_totals_ms.map(Number).filter((n) => Number.isFinite(n) && n >= 0) : [];
+        render();
+        renderLaps();
+        lapBtn.disabled = elapsed <= 0;
+        if (typeof tauriInvoke !== 'function') {
+            saveLocalStopwatch({ elapsed_ms: elapsed, lap_totals_ms: lapTotals.slice() });
+        }
+    }
 }
 
 // --- Todo (Tauri 우선, 없으면 localStorage fallback) ---
@@ -371,5 +435,5 @@ async function initTodos() {
 }
 
 startClock();
-setupStopwatch();
+setupStopwatch().catch((e) => console.error(e));
 initTodos().catch((e) => console.error(e));
