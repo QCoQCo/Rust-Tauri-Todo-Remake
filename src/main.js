@@ -6,6 +6,44 @@ function $(id) {
     return el;
 }
 
+function showRecoveryModal(message) {
+    const modal = document.getElementById('recovery-modal');
+    const msg = document.getElementById('recovery-message');
+    const dismiss = document.getElementById('recovery-dismiss');
+    const reset = document.getElementById('recovery-reset');
+    const restore = document.getElementById('recovery-restore');
+    if (!modal || !msg || !dismiss || !reset || !restore) return;
+
+    msg.textContent = message || '알 수 없는 오류';
+    modal.hidden = false;
+
+    dismiss.onclick = () => {
+        modal.hidden = true;
+    };
+
+    reset.onclick = async () => {
+        const ok = confirm('저장된 데이터와 키를 삭제하고 초기화할까요?');
+        if (!ok) return;
+        if (typeof tauriInvoke !== 'function') return;
+        try {
+            const success = await tauriInvoke('reset_storage', {});
+            if (!success) {
+                alert('초기화에 실패했어요. 콘솔/로그를 확인해주세요.');
+                return;
+            }
+            // 상태가 초기화되었으니 새로고침으로 UI도 정리
+            location.reload();
+        } catch (e) {
+            console.error(e);
+            alert('초기화에 실패했어요. 콘솔/로그를 확인해주세요.');
+        }
+    };
+
+    restore.onclick = () => {
+        alert('백업 복원은 2번(Export/Import)에서 연결할 예정이에요.');
+    };
+}
+
 function formatClock(date) {
     return new Intl.DateTimeFormat('ko-KR', {
         weekday: 'short',
@@ -291,6 +329,17 @@ async function invokeOrFallback(command, payload, fallbackFn) {
     return await fallbackFn();
 }
 
+async function checkRecoveryNeeded() {
+    if (typeof tauriInvoke !== 'function') return;
+    try {
+        const err = await tauriInvoke('get_storage_error', {});
+        if (err) showRecoveryModal(String(err));
+    } catch (e) {
+        // recovery 체크 실패는 앱 동작을 막지 않음
+        console.error(e);
+    }
+}
+
 function renderTasks(tasks) {
     const list = $('task-list');
     const empty = $('empty-state');
@@ -435,5 +484,6 @@ async function initTodos() {
 }
 
 startClock();
+checkRecoveryNeeded().catch((e) => console.error(e));
 setupStopwatch().catch((e) => console.error(e));
 initTodos().catch((e) => console.error(e));

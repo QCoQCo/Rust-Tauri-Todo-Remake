@@ -103,6 +103,19 @@ fn set_key_to_fallback_file(app: &tauri::AppHandle, key: &[u8; 32]) -> Result<()
     Ok(())
 }
 
+fn get_existing_key(app: &tauri::AppHandle) -> Result<Option<[u8; 32]>, String> {
+    // 로드 시에는 "새 키 생성"을 절대 하지 않음
+    if let Some(key) = get_key_from_keyring(app)? {
+        return Ok(Some(key));
+    }
+    if let Some(key) = get_key_from_fallback_file(app)? {
+        // 가능하면 키체인에도 복사(실패해도 무시)
+        let _ = set_key_to_keyring(app, &key);
+        return Ok(Some(key));
+    }
+    Ok(None)
+}
+
 fn get_or_create_key(app: &tauri::AppHandle) -> Result<[u8; 32], String> {
     // 1) OS 키체인 우선
     if let Some(key) = get_key_from_keyring(app)? {
@@ -134,6 +147,9 @@ pub fn load_encrypted(app: &tauri::AppHandle) -> Result<Option<Vec<u8>>, String>
         return Ok(None);
     }
 
+    let key = get_existing_key(app)?
+        .ok_or_else(|| "missing encryption key for existing data (cannot decrypt)".to_string())?;
+
     let raw = fs::read_to_string(&path).map_err(|e| format!("data read error: {e}"))?;
     let env: Envelope = serde_json::from_str(&raw).map_err(|e| format!("envelope parse error: {e}"))?;
     if env.v != 1 {
@@ -152,7 +168,6 @@ pub fn load_encrypted(app: &tauri::AppHandle) -> Result<Option<Vec<u8>>, String>
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let key = get_or_create_key(app)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init error: {e}"))?;
     let pt = cipher
         .decrypt(nonce, ct.as_ref())
@@ -184,6 +199,30 @@ pub fn save_encrypted(app: &tauri::AppHandle, plaintext: &[u8]) -> Result<(), St
     };
     let out = serde_json::to_string(&env).map_err(|e| format!("envelope serialize error: {e}"))?;
     fs::write(&path, out.as_bytes()).map_err(|e| format!("data write error: {e}"))?;
+    Ok(())
+}
+
+pub fn reset_storage(app: &tauri::AppHandle) -> Result<(), String> {
+    let dir = app_data_dir(app)?;
+
+    // 1) 데이터 파일 삭제
+    let data_path = dir.join(DATA_FILENAME);
+    if data_path.exists() {
+        fs::remove_file(&data_path).map_err(|e| format!("failed to remove data file: {e}"))?;
+    }
+
+    // 2) fallback 키 파일 삭제
+    let key_path = dir.join(KEY_FILENAME);
+    if key_path.exists() {
+        fs::remove_file(&key_path).map_err(|e| format!("failed to remove fallback key file: {e}"))?;
+    }
+
+    // 3) 키체인 키 삭제(실패는 무시)
+    let service = service_name(app);
+    if let Ok(entry) = keyring::Entry::new(&service, KEYRING_USERNAME) {
+        let _ = entry.delete_password();
+    }
+
     Ok(())
 }
 

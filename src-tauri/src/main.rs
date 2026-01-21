@@ -41,6 +41,7 @@ impl Default for AppData {
 }
 
 struct AppState(Mutex<AppData>);
+struct StorageState(Mutex<Option<String>>);
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -148,17 +149,28 @@ fn clear_stopwatch_state(state: tauri::State<'_, AppState>, app: tauri::AppHandl
 fn main() {
     tauri::Builder::default()
         .manage(AppState(Mutex::new(AppData::default())))
+        .manage(StorageState(Mutex::new(None)))
         .setup(|app| {
-            if let Ok(Some(bytes)) = storage::load_encrypted(&app.handle()) {
-                match serde_json::from_slice::<AppData>(&bytes) {
+            match storage::load_encrypted(&app.handle()) {
+                Ok(Some(bytes)) => match serde_json::from_slice::<AppData>(&bytes) {
                     Ok(loaded) => {
                         let state = app.state::<AppState>();
                         let mut guard = state.0.lock().unwrap();
                         *guard = loaded;
                     }
-                    Err(e) => eprintln!("failed to parse stored data: {e}"),
+                    Err(e) => {
+                        eprintln!("failed to parse stored data: {e}");
+                        let err_state = app.state::<StorageState>();
+                        *err_state.0.lock().unwrap() = Some(format!("저장 데이터 파싱 실패: {e}"));
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("failed to load encrypted data: {e}");
+                    let err_state = app.state::<StorageState>();
+                    *err_state.0.lock().unwrap() = Some(format!("암호화 데이터 복호화 실패: {e}"));
                 }
-            }
+            };
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -168,8 +180,31 @@ fn main() {
             delete_task,
             get_stopwatch_state,
             set_stopwatch_state,
-            clear_stopwatch_state
+            clear_stopwatch_state,
+            get_storage_error,
+            reset_storage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[tauri::command]
+fn get_storage_error(state: tauri::State<'_, StorageState>) -> Option<String> {
+    state.0.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn reset_storage(
+    data_state: tauri::State<'_, AppState>,
+    err_state: tauri::State<'_, StorageState>,
+    app: tauri::AppHandle,
+) -> bool {
+    if let Err(e) = storage::reset_storage(&app) {
+        eprintln!("reset_storage failed: {e}");
+        return false;
+    }
+
+    *data_state.0.lock().unwrap() = AppData::default();
+    *err_state.0.lock().unwrap() = None;
+    true
 }
