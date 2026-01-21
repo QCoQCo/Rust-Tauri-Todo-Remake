@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Todo</title>
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <div class="app">
+            <header class="topbar">
+                <div class="brand">
+                    <div class="brand__title">Todo</div>
+                    <div class="brand__subtitle">Rust + Tauri</div>
+                </div>
+
+                <div class="clock" aria-label="현재 시간">
+                    <div class="clock__label">Now</div>
+                    <div id="clock" class="clock__value">--:--:--</div>
+                </div>
+            </header>
+
+            <main class="grid">
+                <section class="card">
+                    <div class="card__header">
+                        <h1 class="card__title">할 일</h1>
+                        <div class="status">
+                            <div class="status__item">
+                                <div class="status__label">총 할 일</div>
+                                <div id="status-total" class="status__value">0</div>
+                            </div>
+                            <div class="status__item">
+                                <div class="status__label">완료된 할 일</div>
+                                <div id="status-done" class="status__value">0</div>
+                            </div>
+                            <div class="status__item">
+                                <div class="status__label">진행중인 할 일</div>
+                                <div id="status-inprogress" class="status__value">0</div>
+                            </div>
+                        </div>
+                        <div class="card__actions">
+                            <button
+                                id="toggle-stopwatch"
+                                class="btn btn--ghost"
+                                type="button"
+                                aria-expanded="false"
+                            >
+                                스탑워치
+                            </button>
+                        </div>
+                    </div>
+
+                    <form id="todo-form" class="todo-input" autocomplete="off">
+                        <input
+                            id="new-task"
+                            class="input"
+                            type="text"
+                            placeholder="이곳에 할 일을 입력하세요."
+                            maxlength="120"
+                        />
+                        <button id="add-task" class="btn btn--primary" type="submit">추가</button>
+                    </form>
+
+                    <div id="todo-filter" class="filter" role="group" aria-label="할 일 필터">
+                        <button class="filter__btn is-active" type="button" data-filter="all" aria-pressed="true">
+                            전체
+                        </button>
+                        <button class="filter__btn" type="button" data-filter="inprogress" aria-pressed="false">
+                            진행중
+                        </button>
+                        <button class="filter__btn" type="button" data-filter="done" aria-pressed="false">
+                            완료
+                        </button>
+                    </div>
+
+                    <ul id="task-list" class="todo-list" aria-label="할 일 목록">
+                        <!-- 할 일 목록이 없을 때 빈 상태 표시 -->
+                    </ul>
+
+                    <div id="empty-state" class="empty" hidden>아직 할 일이 없어요.</div>
+                </section>
+
+                <aside id="stopwatch-panel" class="card card--compact" hidden>
+                    <div class="card__header">
+                        <h2 class="card__title">스탑워치</h2>
+                        <div class="pill" id="stopwatch-status">ready</div>
+                    </div>
+
+                    <div id="stopwatch-time" class="stopwatch-time" aria-label="스탑워치 시간">
+                        00:00.00
+                    </div>
+
+                    <div class="stopwatch-actions">
+                        <button id="stopwatch-start" class="btn btn--primary" type="button">
+                            시작
+                        </button>
+                        <button id="stopwatch-lap" class="btn" type="button" disabled>Lap</button>
+                        <button id="stopwatch-reset" class="btn" type="button">리셋</button>
+                    </div>
+
+                    <div class="laps">
+                        <div class="laps__header">
+                            <div class="laps__title">Lap 기록</div>
+                            <div class="laps__actions">
+                                <button id="stopwatch-laps-clear" class="btn btn--ghost btn--xs" type="button" disabled>
+                                    전체 삭제
+                                </button>
+                                <div class="laps__hint">총/구간</div>
+                            </div>
+                        </div>
+                        <ul id="stopwatch-laps" class="laps__list" aria-label="Lap 기록 목록"></ul>
+                        <div id="stopwatch-laps-empty" class="laps__empty">아직 기록이 없어요.</div>
+                    </div>
+                </aside>
+            </main>
+        </div>
+
+        <script type="module" src="./main.js"></script>
+    </body>
+</html>
+<!--
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>To-Do List</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        input, button {
+            padding: 10px;
+            margin: 5px;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        li {
+            padding: 10px;
+            margin: 5px;
+            background-color: #f4f4f4;
+            border: 1px solid #ccc;
+            display: flex;
+            justify-content: space-between;
+        }
+    </link>
+</head>
+<body>
+    <h1>To-Do List</h1>
+    <input id="new-task" type="text" placeholder="Add a new task..." />
+    <button onclick="addTask()">Add</button>
+    <ul id="task-list"></ul>
+</body>
+</html>
+-->

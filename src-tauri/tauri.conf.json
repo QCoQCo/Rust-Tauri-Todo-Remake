@@ -1,0 +1,36 @@
+{
+    "build": {
+        "devPath": "../src",
+        "distDir": "../src",
+        "withGlobalTauri": true
+    },
+    "package": {
+        "productName": "todo-app",
+        "version": "0.1.0"
+    },
+    "tauri": {
+        "allowlist": {
+            "all": false,
+            "shell": {
+                "all": false,
+                "open": true
+            }
+        },
+        "windows": [
+            {
+                "title": "todo-app",
+                "width": 950,
+                "height": 800
+            }
+        ],
+        "security": {
+            "csp": null
+        },
+        "bundle": {
+            "active": true,
+            "targets": "all",
+            "identifier": "com.todo-app.app",
+            "icon": ["icons/icon.png"]
+        }
+    }
+}
