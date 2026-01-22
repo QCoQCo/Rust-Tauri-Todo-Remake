@@ -11,13 +11,16 @@ edition = "2021"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = ["shell-open"] }
+tauri = { version = "1", features = ["shell-open", "dialog-open", "dialog-save", "dialog-message", "dialog-confirm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.8"
 keyring = "2"
+hmac = "0.12"
+sha2 = "0.10"
+chrono = "0.4"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
