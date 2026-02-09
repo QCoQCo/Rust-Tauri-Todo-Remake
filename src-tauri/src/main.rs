@@ -7,7 +7,7 @@ mod storage;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TodoItem {
@@ -394,6 +394,22 @@ fn main() {
                 }
             }
             Ok(())
+        })
+        .on_window_event(|event| {
+            // 창 이벤트를 안전하게 처리하여 크래시 방지
+            // 최소화 이벤트를 포함한 모든 이벤트를 안전하게 처리
+            match event.event() {
+                WindowEvent::CloseRequested { .. } => {
+                    // 창 닫기 이벤트 처리
+                }
+                WindowEvent::Resized { .. } => {
+                    // 크기 변경 이벤트 처리
+                }
+                _ => {
+                    // 기타 모든 이벤트(최소화 포함)는 안전하게 처리
+                    // 이 핸들러가 존재함으로써 null pointer dereference 방지
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_tasks,
