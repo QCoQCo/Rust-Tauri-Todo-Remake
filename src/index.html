@@ -5,6 +5,7 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Todo</title>
         <link rel="stylesheet" href="styles.css" />
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     </head>
     <body>
         <div class="app">
@@ -40,6 +41,30 @@
                         </div>
                         <div class="card__actions">
                             <button
+                                id="export-data"
+                                class="btn btn--ghost btn--xs"
+                                type="button"
+                                title="백업 내보내기"
+                            >
+                                내보내기
+                            </button>
+                            <button
+                                id="import-data"
+                                class="btn btn--ghost btn--xs"
+                                type="button"
+                                title="백업 가져오기"
+                            >
+                                가져오기
+                            </button>
+                            <button
+                                id="toggle-stats"
+                                class="btn btn--ghost btn--xs"
+                                type="button"
+                                aria-expanded="false"
+                            >
+                                통계
+                            </button>
+                            <button
                                 id="toggle-stopwatch"
                                 class="btn btn--ghost"
                                 type="button"
@@ -62,13 +87,28 @@
                     </form>
 
                     <div id="todo-filter" class="filter" role="group" aria-label="할 일 필터">
-                        <button class="filter__btn is-active" type="button" data-filter="all" aria-pressed="true">
+                        <button
+                            class="filter__btn is-active"
+                            type="button"
+                            data-filter="all"
+                            aria-pressed="true"
+                        >
                             전체
                         </button>
-                        <button class="filter__btn" type="button" data-filter="inprogress" aria-pressed="false">
+                        <button
+                            class="filter__btn"
+                            type="button"
+                            data-filter="inprogress"
+                            aria-pressed="false"
+                        >
                             진행중
                         </button>
-                        <button class="filter__btn" type="button" data-filter="done" aria-pressed="false">
+                        <button
+                            class="filter__btn"
+                            type="button"
+                            data-filter="done"
+                            aria-pressed="false"
+                        >
                             완료
                         </button>
                     </div>
@@ -102,7 +142,12 @@
                         <div class="laps__header">
                             <div class="laps__title">Lap 기록</div>
                             <div class="laps__actions">
-                                <button id="stopwatch-laps-clear" class="btn btn--ghost btn--xs" type="button" disabled>
+                                <button
+                                    id="stopwatch-laps-clear"
+                                    class="btn btn--ghost btn--xs"
+                                    type="button"
+                                    disabled
+                                >
                                     전체 삭제
                                 </button>
                                 <div class="laps__hint">총/구간</div>
@@ -110,6 +155,65 @@
                         </div>
                         <ul id="stopwatch-laps" class="laps__list" aria-label="Lap 기록 목록"></ul>
                         <div id="stopwatch-laps-empty" class="laps__empty">아직 기록이 없어요.</div>
+                    </div>
+                </aside>
+
+                <aside id="stats-panel" class="card card--compact" hidden>
+                    <div class="card__header">
+                        <h2 class="card__title">작업 통계</h2>
+                    </div>
+
+                    <div class="stats-controls">
+                        <div class="stats-date-range">
+                            <label for="stats-start-date">시작일</label>
+                            <input id="stats-start-date" type="date" class="input input--date" />
+                            <label for="stats-end-date">종료일</label>
+                            <input id="stats-end-date" type="date" class="input input--date" />
+                        </div>
+                        <div class="stats-actions">
+                            <button id="stats-load" class="btn btn--primary btn--xs" type="button">
+                                조회
+                            </button>
+                            <button
+                                id="stats-export-csv"
+                                class="btn btn--ghost btn--xs"
+                                type="button"
+                            >
+                                CSV 내보내기
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="stats-content" class="stats-content">
+                        <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="stat-card__label">완료된 할 일</div>
+                                <div id="stat-completed" class="stat-card__value">-</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card__label">생성된 할 일</div>
+                                <div id="stat-created" class="stat-card__value">-</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card__label">집중 시간</div>
+                                <div id="stat-focus" class="stat-card__value">-</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card__label">평균 Lap 시간</div>
+                                <div id="stat-avg-lap" class="stat-card__value">-</div>
+                            </div>
+                        </div>
+                        <div class="stats-charts">
+                            <div class="chart-container">
+                                <canvas id="stats-chart-tasks"></canvas>
+                            </div>
+                            <div class="chart-container">
+                                <canvas id="stats-chart-focus"></canvas>
+                            </div>
+                        </div>
+                        <div id="stats-empty" class="empty">
+                            날짜를 선택하고 조회 버튼을 눌러주세요.
+                        </div>
                     </div>
                 </aside>
             </main>

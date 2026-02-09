@@ -14,13 +14,20 @@
             "shell": {
                 "all": false,
                 "open": true
+            },
+            "dialog": {
+                "all": false,
+                "open": true,
+                "save": true,
+                "message": true,
+                "confirm": true
             }
         },
         "windows": [
             {
                 "title": "todo-app",
-                "width": 950,
-                "height": 800
+                "width": 1250,
+                "height": 900
             }
         ],
         "security": {

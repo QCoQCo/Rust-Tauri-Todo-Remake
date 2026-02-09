@@ -1,4 +1,5 @@
 const tauriInvoke = globalThis?.__TAURI__?.tauri?.invoke;
+const tauriDialog = globalThis?.__TAURI__?.dialog;
 
 function $(id) {
     const el = document.getElementById(id);
@@ -42,8 +43,13 @@ function loadLocalStopwatch() {
         const parsed = raw ? JSON.parse(raw) : null;
         if (!parsed) return null;
         const elapsed_ms = Number(parsed.elapsed_ms ?? 0);
-        const lap_totals_ms = Array.isArray(parsed.lap_totals_ms) ? parsed.lap_totals_ms.map(Number) : [];
-        return { elapsed_ms: Math.max(0, elapsed_ms), lap_totals_ms: lap_totals_ms.filter((n) => Number.isFinite(n) && n >= 0) };
+        const lap_totals_ms = Array.isArray(parsed.lap_totals_ms)
+            ? parsed.lap_totals_ms.map(Number)
+            : [];
+        return {
+            elapsed_ms: Math.max(0, elapsed_ms),
+            lap_totals_ms: lap_totals_ms.filter((n) => Number.isFinite(n) && n >= 0),
+        };
     } catch {
         return null;
     }
@@ -136,14 +142,10 @@ async function setupStopwatch() {
 
     const persistStopwatch = async () => {
         const snapshot = { elapsed_ms: getCurrentMs(), lap_totals_ms: lapTotals.slice() };
-        await invokeOrFallback(
-            'set_stopwatch_state',
-            { stopwatch: snapshot },
-            async () => {
-                saveLocalStopwatch(snapshot);
-                return snapshot;
-            },
-        );
+        await invokeOrFallback('set_stopwatch_state', { stopwatch: snapshot }, async () => {
+            saveLocalStopwatch(snapshot);
+            return snapshot;
+        });
     };
 
     const stop = () => {
@@ -183,14 +185,10 @@ async function setupStopwatch() {
         lapBtn.disabled = true;
         render();
         renderLaps();
-        invokeOrFallback(
-            'clear_stopwatch_state',
-            {},
-            async () => {
-                localStorage.removeItem(STOPWATCH_STORAGE_KEY);
-                return true;
-            },
-        ).catch((e) => console.error(e));
+        invokeOrFallback('clear_stopwatch_state', {}, async () => {
+            localStorage.removeItem(STOPWATCH_STORAGE_KEY);
+            return true;
+        }).catch((e) => console.error(e));
     };
 
     const clearLaps = () => {
@@ -244,14 +242,14 @@ async function setupStopwatch() {
     lapBtn.disabled = true;
 
     // 초기 로드(tauri 우선)
-    const loaded = await invokeOrFallback(
-        'get_stopwatch_state',
-        {},
-        async () => loadLocalStopwatch(),
+    const loaded = await invokeOrFallback('get_stopwatch_state', {}, async () =>
+        loadLocalStopwatch(),
     );
     if (loaded && typeof loaded === 'object') {
         elapsed = Number(loaded.elapsed_ms ?? 0) || 0;
-        lapTotals = Array.isArray(loaded.lap_totals_ms) ? loaded.lap_totals_ms.map(Number).filter((n) => Number.isFinite(n) && n >= 0) : [];
+        lapTotals = Array.isArray(loaded.lap_totals_ms)
+            ? loaded.lap_totals_ms.map(Number).filter((n) => Number.isFinite(n) && n >= 0)
+            : [];
         render();
         renderLaps();
         lapBtn.disabled = elapsed <= 0;
@@ -356,9 +354,17 @@ function renderTasks(tasks) {
 
         cb.addEventListener('change', async () => {
             const updated = await invokeOrFallback('toggle_task', { id: t.id }, async () => {
-                const local = loadLocalTasks().map((x) =>
-                    x.id === t.id ? { ...x, completed: !x.completed } : x,
-                );
+                const local = loadLocalTasks().map((x) => {
+                    if (x.id === t.id) {
+                        const newCompleted = !x.completed;
+                        return {
+                            ...x,
+                            completed: newCompleted,
+                            completed_at: newCompleted ? Math.floor(Date.now() / 1000) : null,
+                        };
+                    }
+                    return x;
+                });
                 saveLocalTasks(local);
                 return local;
             });
@@ -381,10 +387,99 @@ function renderTasks(tasks) {
     });
 }
 
+async function exportData() {
+    if (typeof tauriInvoke !== 'function' || !tauriDialog) {
+        window.alert('Tauri 환경에서만 백업 내보내기가 가능합니다.');
+        return;
+    }
+    try {
+        const timestamp = Math.floor(Date.now() / 1000);
+        const defaultName = `todo_backup_${timestamp}.json`;
+        const filePath = await tauriDialog.save({
+            defaultPath: defaultName,
+            filters: [{ name: 'Backup', extensions: ['json'] }],
+        });
+        if (!filePath || (Array.isArray(filePath) && filePath.length === 0)) {
+            return; // 사용자가 취소
+        }
+        // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
+        const path = Array.isArray(filePath) ? filePath[0] : filePath;
+        console.log('Export path:', path);
+        console.log('Invoking with:', { file_path: path });
+        const savedPath = await tauriInvoke('export_data', { file_path: path });
+        window.alert(`백업이 저장되었습니다:\n${savedPath}`);
+    } catch (e) {
+        if (String(e).includes('cancelled') || String(e).includes('user cancelled')) {
+            return; // 사용자가 취소
+        }
+        window.alert(`백업 내보내기 실패: ${e}`);
+        console.error(e);
+    }
+}
+
+async function importData() {
+    if (typeof tauriInvoke !== 'function' || !tauriDialog) {
+        window.alert('Tauri 환경에서만 백업 가져오기가 가능합니다.');
+        return;
+    }
+    if (!window.confirm('현재 데이터가 백업 파일로 대체됩니다. 계속하시겠습니까?')) {
+        return;
+    }
+    try {
+        const filePath = await tauriDialog.open({
+            filters: [{ name: 'Backup', extensions: ['json'] }],
+        });
+        if (!filePath || (Array.isArray(filePath) && filePath.length === 0)) {
+            return; // 사용자가 취소
+        }
+        // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
+        const path = Array.isArray(filePath) ? filePath[0] : filePath;
+        const imported = await tauriInvoke('import_data', { file_path: path });
+        if (imported && imported.tasks) {
+            renderTasks(imported.tasks);
+            if (imported.stopwatch) {
+                // 스탑워치 상태도 복원 (선택적)
+                const stopwatchState = imported.stopwatch;
+                await invokeOrFallback(
+                    'set_stopwatch_state',
+                    { stopwatch: stopwatchState },
+                    async () => {
+                        saveLocalStopwatch({
+                            elapsed_ms: stopwatchState.elapsed_ms,
+                            lap_totals_ms: stopwatchState.lap_totals_ms,
+                        });
+                        return stopwatchState;
+                    },
+                );
+                // 스탑워치 UI 새로고침을 위해 페이지 리로드 또는 상태 동기화
+                location.reload();
+            } else {
+                renderTasks(imported.tasks);
+            }
+            window.alert('백업이 성공적으로 가져와졌습니다.');
+        }
+    } catch (e) {
+        if (String(e).includes('cancelled') || String(e).includes('user cancelled')) {
+            return; // 사용자가 취소
+        }
+        window.alert(`백업 가져오기 실패: ${e}`);
+        console.error(e);
+    }
+}
+
 async function initTodos() {
     const form = $('todo-form');
     const input = $('new-task');
     const filterEl = document.getElementById('todo-filter');
+    const exportBtn = document.getElementById('export-data');
+    const importBtn = document.getElementById('import-data');
+
+    if (exportBtn) {
+        exportBtn.addEventListener('click', exportData);
+    }
+    if (importBtn) {
+        importBtn.addEventListener('click', importData);
+    }
 
     if (filterEl) {
         filterEl.addEventListener('click', (e) => {
@@ -419,7 +514,13 @@ async function initTodos() {
             const local = loadLocalTasks();
             const id = Date.now();
             const next = [
-                { id, text, completed: false, created_at: Math.floor(Date.now() / 1000) },
+                {
+                    id,
+                    text,
+                    completed: false,
+                    created_at: Math.floor(Date.now() / 1000),
+                    completed_at: null,
+                },
                 ...local,
             ];
             saveLocalTasks(next);
@@ -434,6 +535,310 @@ async function initTodos() {
     await refresh();
 }
 
+function formatMsToTime(ms) {
+    const totalSecs = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSecs / 3600);
+    const minutes = Math.floor((totalSecs % 3600) / 60);
+    if (hours > 0) {
+        return `${hours}시간 ${minutes}분`;
+    }
+    return `${minutes}분`;
+}
+
+function formatMsToSec(ms) {
+    return (ms / 1000).toFixed(1);
+}
+
+async function setupStats() {
+    const toggleBtn = document.getElementById('toggle-stats');
+    const panel = document.getElementById('stats-panel');
+    const startDateInput = document.getElementById('stats-start-date');
+    const endDateInput = document.getElementById('stats-end-date');
+    const loadBtn = document.getElementById('stats-load');
+    const exportBtn = document.getElementById('stats-export-csv');
+    const content = document.getElementById('stats-content');
+    const empty = document.getElementById('stats-empty');
+    const chartTasksCanvas = document.getElementById('stats-chart-tasks');
+    const chartFocusCanvas = document.getElementById('stats-chart-focus');
+
+    let chartTasks = null;
+    let chartFocus = null;
+
+    if (!window.Chart) {
+        console.error('Chart.js가 로드되지 않았습니다.');
+        return;
+    }
+
+    // Chart.js 기본 색상 설정
+    const chartColors = {
+        completed: 'rgba(124, 92, 255, 0.8)',
+        created: 'rgba(47, 230, 199, 0.8)',
+        focus: 'rgba(92, 124, 255, 0.8)',
+    };
+
+    // 오늘 날짜로 기본 설정
+    const today = new Date();
+    const weekAgo = new Date(today);
+    weekAgo.setDate(today.getDate() - 7);
+    startDateInput.value = weekAgo.toISOString().split('T')[0];
+    endDateInput.value = today.toISOString().split('T')[0];
+
+    const loadStats = async () => {
+        const startDate = startDateInput.value;
+        const endDate = endDateInput.value;
+        if (!startDate || !endDate) {
+            window.alert('시작일과 종료일을 모두 선택해주세요.');
+            return;
+        }
+
+        try {
+            // 일별 통계를 수집
+            const dates = [];
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                dates.push(d.toISOString().split('T')[0]);
+            }
+
+            let totalCompleted = 0;
+            let totalCreated = 0;
+            let totalFocusMs = 0;
+            let totalLaps = 0;
+            let lapTimes = [];
+
+            const dailyStats = [];
+            for (const date of dates) {
+                const stats = await invokeOrFallback(
+                    'get_daily_stats',
+                    { date },
+                    async () => {
+                        return {
+                            tasks_completed: 0,
+                            tasks_created: 0,
+                            focus_time_ms: 0,
+                            lap_count: 0,
+                            avg_lap_time_ms: null,
+                        };
+                    },
+                );
+                dailyStats.push({ date, ...stats });
+                totalCompleted += stats.tasks_completed || 0;
+                totalCreated += stats.tasks_created || 0;
+                totalFocusMs += stats.focus_time_ms || 0;
+                totalLaps += stats.lap_count || 0;
+                if (stats.avg_lap_time_ms) {
+                    lapTimes.push(stats.avg_lap_time_ms);
+                }
+            }
+
+            const avgLapMs =
+                lapTimes.length > 0
+                    ? lapTimes.reduce((a, b) => a + b, 0) / lapTimes.length
+                    : null;
+
+            // UI 업데이트
+            document.getElementById('stat-completed').textContent = String(totalCompleted);
+            document.getElementById('stat-created').textContent = String(totalCreated);
+            document.getElementById('stat-focus').textContent = formatMsToTime(totalFocusMs);
+            document.getElementById('stat-avg-lap').textContent = avgLapMs
+                ? `${formatMsToSec(avgLapMs)}초`
+                : '-';
+
+            // 차트 데이터 준비
+            const labels = dailyStats.map((s) => {
+                const d = new Date(s.date);
+                return `${d.getMonth() + 1}/${d.getDate()}`;
+            });
+            const completedData = dailyStats.map((s) => s.tasks_completed || 0);
+            const createdData = dailyStats.map((s) => s.tasks_created || 0);
+            const focusData = dailyStats.map((s) => Math.floor((s.focus_time_ms || 0) / 60000)); // 분 단위
+
+            // 할 일 차트 (Bar)
+            if (chartTasks) {
+                chartTasks.destroy();
+            }
+            chartTasks = new Chart(chartTasksCanvas, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: '완료된 할 일',
+                            data: completedData,
+                            backgroundColor: chartColors.completed,
+                            borderColor: chartColors.completed,
+                            borderWidth: 1,
+                        },
+                        {
+                            label: '생성된 할 일',
+                            data: createdData,
+                            backgroundColor: chartColors.created,
+                            borderColor: chartColors.created,
+                            borderWidth: 1,
+                        },
+                    ],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: 'rgba(255, 255, 255, 0.8)',
+                                font: { size: 11 },
+                            },
+                        },
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.6)',
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)',
+                            },
+                        },
+                        x: {
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.6)',
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)',
+                            },
+                        },
+                    },
+                },
+            });
+
+            // 집중 시간 차트 (Line)
+            if (chartFocus) {
+                chartFocus.destroy();
+            }
+            chartFocus = new Chart(chartFocusCanvas, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: '집중 시간 (분)',
+                            data: focusData,
+                            borderColor: chartColors.focus,
+                            backgroundColor: 'rgba(92, 124, 255, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                        },
+                    ],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: 'rgba(255, 255, 255, 0.8)',
+                                font: { size: 11 },
+                            },
+                        },
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.6)',
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)',
+                            },
+                        },
+                        x: {
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.6)',
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)',
+                            },
+                        },
+                    },
+                },
+            });
+
+            content.querySelector('.stats-grid').hidden = false;
+            content.querySelector('.stats-charts').hidden = false;
+            empty.hidden = true;
+        } catch (e) {
+            window.alert(`통계 조회 실패: ${e}`);
+            console.error(e);
+        }
+    };
+
+    const exportCsv = async () => {
+        const startDate = startDateInput.value;
+        const endDate = endDateInput.value;
+        if (!startDate || !endDate) {
+            window.alert('시작일과 종료일을 모두 선택해주세요.');
+            return;
+        }
+
+        if (typeof tauriInvoke !== 'function' || !tauriDialog) {
+            window.alert('Tauri 환경에서만 CSV 내보내기가 가능합니다.');
+            return;
+        }
+
+        try {
+            const defaultName = `todo_stats_${startDate}_${endDate}.csv`;
+            const filePath = await tauriDialog.save({
+                defaultPath: defaultName,
+                filters: [{ name: 'CSV', extensions: ['csv'] }],
+            });
+            if (!filePath || (Array.isArray(filePath) && filePath.length === 0)) {
+                return; // 사용자가 취소
+            }
+            const path = Array.isArray(filePath) ? filePath[0] : filePath;
+            const savedPath = await tauriInvoke('export_stats_csv', {
+                start_date: startDate,
+                end_date: endDate,
+                file_path: path,
+            });
+            window.alert(`CSV가 저장되었습니다:\n${savedPath}`);
+        } catch (e) {
+            if (String(e).includes('cancelled') || String(e).includes('user cancelled')) {
+                return; // 사용자가 취소
+            }
+            window.alert(`CSV 내보내기 실패: ${e}`);
+            console.error(e);
+        }
+    };
+
+    if (toggleBtn && panel) {
+        toggleBtn.addEventListener('click', () => {
+            const isOpen = !panel.hidden;
+            panel.hidden = isOpen;
+            toggleBtn.setAttribute('aria-expanded', String(!isOpen));
+        });
+    }
+
+    if (loadBtn) {
+        loadBtn.addEventListener('click', loadStats);
+    }
+
+    if (exportBtn) {
+        exportBtn.addEventListener('click', exportCsv);
+    }
+
+    // 초기 상태
+    if (content) {
+        content.querySelector('.stats-grid').hidden = true;
+        content.querySelector('.stats-charts').hidden = true;
+    }
+}
+
 startClock();
 setupStopwatch().catch((e) => console.error(e));
 initTodos().catch((e) => console.error(e));
+setupStats().catch((e) => console.error(e));
