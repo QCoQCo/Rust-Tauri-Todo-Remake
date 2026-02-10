@@ -17,6 +17,11 @@
 
 Tauri와 Vanilla JavaScript로 만든 **데스크톱 투두·스탑워치·통계 앱**입니다. 할 일 관리, 스탑워치(랩 타임), 기간별 통계·차트, 암호화 백업/복원을 지원합니다.
 
+<p align="center">
+  <img src="demo/스크린샷%202026-02-10%20오전%2010.20.30.png" alt="Todo App 메인 화면" width="700">
+</p>
+<p align="center"><em>메인 화면 스크린샷</em></p>
+
 ---
 
 ### 주요 기능
@@ -131,6 +136,11 @@ npm run tauri build
 # Todo App (Tauri + Vanilla)
 
 Tauri と Vanilla JavaScript で作った **デスクトップ用 Todo・ストップウォッチ・統計アプリ**です。タスク管理、ストップウォッチ（ラップタイム）、期間別統計・グラフ、暗号化バックアップ/復元に対応しています。
+
+<p align="center">
+  <img src="demo/스크린샷%202026-02-10%20오전%2010.20.30.png" alt="Todo App メイン画面" width="700">
+</p>
+<p align="center"><em>メイン画面スクリーンショット</em></p>
 
 ---
 
