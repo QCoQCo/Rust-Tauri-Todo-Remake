@@ -838,7 +838,27 @@ async function setupStats() {
     }
 }
 
+// 시작 시 저장 데이터를 불러오지 못했으면 한 번 알림
+async function reportLoadFailure() {
+    if (typeof tauriInvoke !== 'function') return;
+    const failure = await tauriInvoke('take_load_failure');
+    if (!failure) return;
+
+    const lines = [
+        '저장된 데이터를 불러오지 못해 빈 상태로 시작합니다.',
+        `원인: ${failure.reason}`,
+    ];
+    if (failure.preserved_path) {
+        lines.push(`기존 데이터 파일은 삭제하지 않고 다음 위치에 보존했습니다:\n${failure.preserved_path}`);
+    }
+    if (failure.writes_blocked) {
+        lines.push('기존 데이터 파일을 보존하지 못해, 이번 실행에서는 변경 사항이 저장되지 않습니다.');
+    }
+    window.alert(lines.join('\n\n'));
+}
+
 startClock();
 setupStopwatch().catch((e) => console.error(e));
 initTodos().catch((e) => console.error(e));
 setupStats().catch((e) => console.error(e));
+reportLoadFailure().catch((e) => console.error(e));

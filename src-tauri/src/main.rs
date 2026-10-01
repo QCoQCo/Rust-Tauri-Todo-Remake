@@ -43,6 +43,16 @@ impl Default for AppData {
 
 struct AppState(Mutex<AppData>);
 
+// 시작 시 저장 데이터를 불러오지 못한 경우 (프론트에서 한 번 알림)
+#[derive(Clone, Serialize)]
+struct LoadFailure {
+    reason: String,
+    preserved_path: Option<String>, // 원본을 옮겨 보존한 위치
+    writes_blocked: bool,           // 보존에 실패해 저장을 막았는지
+}
+
+struct LoadFailureState(Mutex<Option<LoadFailure>>);
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -66,6 +76,11 @@ fn persist(app: &tauri::AppHandle, data: &AppData) {
         }
         Err(e) => eprintln!("persist serialize failed: {e}"),
     }
+}
+
+#[tauri::command]
+fn take_load_failure(state: tauri::State<'_, LoadFailureState>) -> Option<LoadFailure> {
+    state.0.lock().unwrap().take()
 }
 
 #[tauri::command]
@@ -382,15 +397,41 @@ async fn export_stats_csv(
 fn main() {
     tauri::Builder::default()
         .manage(AppState(Mutex::new(AppData::default())))
+        .manage(LoadFailureState(Mutex::new(None)))
         .setup(|app| {
-            if let Ok(Some(bytes)) = storage::load_encrypted(&app.handle()) {
-                match serde_json::from_slice::<AppData>(&bytes) {
-                    Ok(loaded) => {
-                        let state = app.state::<AppState>();
-                        let mut guard = state.0.lock().unwrap();
-                        *guard = loaded;
-                    }
-                    Err(e) => eprintln!("failed to parse stored data: {e}"),
+            let handle = app.handle();
+            let loaded = storage::load_encrypted(&handle).and_then(|bytes| {
+                bytes
+                    .map(|b| {
+                        serde_json::from_slice::<AppData>(&b)
+                            .map_err(|e| format!("stored data parse error: {e}"))
+                    })
+                    .transpose()
+            });
+            match loaded {
+                Ok(Some(data)) => {
+                    let state = app.state::<AppState>();
+                    let mut guard = state.0.lock().unwrap();
+                    *guard = data;
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    // 빈 상태로 시작하되, 다음 저장이 원본을 덮어쓰지 않도록 원본을 옆으로 옮겨 둔다
+                    eprintln!("failed to load stored data: {reason}");
+                    let (preserved_path, writes_blocked) = match storage::quarantine_data_file(&handle) {
+                        Ok(path) => (Some(path.to_string_lossy().to_string()), false),
+                        Err(e) => {
+                            eprintln!("failed to preserve stored data: {e}");
+                            (None, true)
+                        }
+                    };
+                    let state = app.state::<LoadFailureState>();
+                    let mut guard = state.0.lock().unwrap();
+                    *guard = Some(LoadFailure {
+                        reason,
+                        preserved_path,
+                        writes_blocked,
+                    });
                 }
             }
             Ok(())
@@ -412,6 +453,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            take_load_failure,
             get_tasks,
             add_task,
             toggle_task,
