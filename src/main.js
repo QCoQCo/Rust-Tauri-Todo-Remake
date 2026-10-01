@@ -549,6 +549,20 @@ function formatMsToSec(ms) {
     return (ms / 1000).toFixed(1);
 }
 
+// 로컬 시간대 기준 'YYYY-MM-DD' (toISOString은 UTC 날짜라 KST 오전 9시 전에는 하루 밀림)
+function toLocalYmd(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
+
+// 'YYYY-MM-DD'를 로컬 자정으로 파싱 (new Date('YYYY-MM-DD')는 UTC 자정으로 파싱됨)
+function parseLocalYmd(ymd) {
+    const [y, m, d] = ymd.split('-').map(Number);
+    return new Date(y, m - 1, d);
+}
+
 async function setupStats() {
     const toggleBtn = document.getElementById('toggle-stats');
     const panel = document.getElementById('stats-panel');
@@ -576,28 +590,40 @@ async function setupStats() {
         focus: 'rgba(92, 124, 255, 0.8)',
     };
 
-    // 오늘 날짜로 기본 설정
+    // 기본 범위: 오늘 포함 최근 7일
     const today = new Date();
     const weekAgo = new Date(today);
-    weekAgo.setDate(today.getDate() - 7);
-    startDateInput.value = weekAgo.toISOString().split('T')[0];
-    endDateInput.value = today.toISOString().split('T')[0];
+    weekAgo.setDate(today.getDate() - 6);
+    startDateInput.value = toLocalYmd(weekAgo);
+    endDateInput.value = toLocalYmd(today);
 
-    const loadStats = async () => {
+    // 입력된 기간을 검증하고, 잘못되면 알린 뒤 null 반환
+    const readRange = () => {
         const startDate = startDateInput.value;
         const endDate = endDateInput.value;
         if (!startDate || !endDate) {
             window.alert('시작일과 종료일을 모두 선택해주세요.');
-            return;
+            return null;
         }
+        // 'YYYY-MM-DD'는 문자열 비교가 날짜 순서와 같음
+        if (startDate > endDate) {
+            window.alert('시작일이 종료일보다 늦습니다. 기간을 다시 선택해주세요.');
+            return null;
+        }
+        return { startDate, endDate };
+    };
+
+    const loadStats = async () => {
+        const range = readRange();
+        if (!range) return;
+        const { startDate, endDate } = range;
 
         try {
             // 일별 통계를 수집
             const dates = [];
-            const start = new Date(startDate);
-            const end = new Date(endDate);
-            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-                dates.push(d.toISOString().split('T')[0]);
+            const end = parseLocalYmd(endDate);
+            for (let d = parseLocalYmd(startDate); d <= end; d.setDate(d.getDate() + 1)) {
+                dates.push(toLocalYmd(d));
             }
 
             let totalCompleted = 0;
@@ -646,8 +672,8 @@ async function setupStats() {
 
             // 차트 데이터 준비
             const labels = dailyStats.map((s) => {
-                const d = new Date(s.date);
-                return `${d.getMonth() + 1}/${d.getDate()}`;
+                const [, m, d] = s.date.split('-').map(Number);
+                return `${m}/${d}`;
             });
             const completedData = dailyStats.map((s) => s.tasks_completed || 0);
             const createdData = dailyStats.map((s) => s.tasks_created || 0);
@@ -778,12 +804,9 @@ async function setupStats() {
     };
 
     const exportCsv = async () => {
-        const startDate = startDateInput.value;
-        const endDate = endDateInput.value;
-        if (!startDate || !endDate) {
-            window.alert('시작일과 종료일을 모두 선택해주세요.');
-            return;
-        }
+        const range = readRange();
+        if (!range) return;
+        const { startDate, endDate } = range;
 
         if (typeof tauriInvoke !== 'function' || !tauriDialog) {
             window.alert('Tauri 환경에서만 CSV 내보내기가 가능합니다.');
@@ -820,6 +843,8 @@ async function setupStats() {
             const isOpen = !panel.hidden;
             panel.hidden = isOpen;
             toggleBtn.setAttribute('aria-expanded', String(!isOpen));
+            // 열 때마다 현재 기간으로 바로 조회
+            if (!isOpen) loadStats();
         });
     }
 

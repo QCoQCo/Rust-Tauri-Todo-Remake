@@ -4,6 +4,7 @@
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 mod storage;
 
+use chrono::{Days, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -225,45 +226,31 @@ struct WeeklyStats {
     daily_stats: Vec<DailyStats>,
 }
 
-fn date_to_timestamp(date_str: &str) -> i64 {
-    // YYYY-MM-DD를 timestamp로 변환 (자정 기준)
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
-        return 0;
-    }
-    let year: i32 = parts[0].parse().unwrap_or(1970);
-    let month: u32 = parts[1].parse().unwrap_or(1);
-    let day: u32 = parts[2].parse().unwrap_or(1);
-    
-    let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| dt.and_utc().timestamp())
-        .unwrap_or(0);
-    
-    dt
+fn parse_date(date_str: &str) -> Result<NaiveDate, String> {
+    // YYYY-MM-DD
+    NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d")
+        .map_err(|e| format!("invalid date '{date_str}': {e}"))
 }
 
-fn timestamp_to_date(ts: i64) -> String {
-    use chrono::TimeZone;
-    let dt = chrono::Utc.timestamp_opt(ts, 0).unwrap();
-    dt.format("%Y-%m-%d").to_string()
+/// 주어진 시간대에서 그 날짜가 시작되는 순간 (epoch 초)
+fn day_start<Tz: TimeZone>(tz: &Tz, date: NaiveDate) -> i64 {
+    // DST로 자정이 건너뛰어지는 지역이면 그날 처음 존재하는 정각을 사용
+    (0..24)
+        .filter_map(|h| date.and_hms_opt(h, 0, 0))
+        .find_map(|naive| tz.from_local_datetime(&naive).earliest())
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|| date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
 }
 
-fn get_date_range(start_date: &str, end_date: &str) -> Vec<String> {
-    let start_ts = date_to_timestamp(start_date);
-    let end_ts = date_to_timestamp(end_date);
-    let mut dates = Vec::new();
-    let mut current = start_ts;
-    while current <= end_ts {
-        dates.push(timestamp_to_date(current));
-        current += 86400; // 하루 추가
-    }
-    dates
+/// start ~ end (양 끝 포함). start가 end보다 늦으면 빈 목록
+fn date_range(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+    start.iter_days().take_while(|d| *d <= end).collect()
 }
 
-fn compute_daily_stats(data: &AppData, date: &str) -> DailyStats {
-    let start_ts = date_to_timestamp(date);
-    let end_ts = start_ts + 86400; // 다음 날 자정 전까지
+fn compute_daily_stats<Tz: TimeZone>(data: &AppData, date: NaiveDate, tz: &Tz) -> DailyStats {
+    // 하루 길이를 86400초로 가정하지 않고 다음 날 시작 시각까지로 계산 (DST 대응)
+    let start_ts = day_start(tz, date);
+    let end_ts = date.succ_opt().map_or(i64::MAX, |next| day_start(tz, next));
 
     let tasks_completed = data
         .tasks
@@ -297,7 +284,7 @@ fn compute_daily_stats(data: &AppData, date: &str) -> DailyStats {
     };
 
     DailyStats {
-        date: date.to_string(),
+        date: date.format("%Y-%m-%d").to_string(),
         tasks_completed,
         tasks_created,
         focus_time_ms,
@@ -311,8 +298,9 @@ fn get_daily_stats(
     date: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DailyStats, String> {
+    let date = parse_date(&date)?;
     let data = state.0.lock().unwrap();
-    Ok(compute_daily_stats(&data, &date))
+    Ok(compute_daily_stats(&data, date, &Local))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -320,9 +308,13 @@ fn get_weekly_stats(
     start_date: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<WeeklyStats, String> {
+    let start = parse_date(&start_date)?;
+    let end = start
+        .checked_add_days(Days::new(6))
+        .ok_or_else(|| format!("date out of range: {start_date}"))?;
+    let end_date = end.format("%Y-%m-%d").to_string();
+    let dates = date_range(start, end);
     let data = state.0.lock().unwrap();
-    let dates = get_date_range(&start_date, &timestamp_to_date(date_to_timestamp(&start_date) + 6 * 86400));
-    let end_date = dates.last().unwrap().clone();
 
     let mut daily_stats = Vec::new();
     let mut total_completed = 0u32;
@@ -330,8 +322,8 @@ fn get_weekly_stats(
     let mut total_focus_ms = 0u64;
     let mut total_laps = 0u32;
 
-    for date in &dates {
-        let stats = compute_daily_stats(&data, date);
+    for date in dates {
+        let stats = compute_daily_stats(&data, date, &Local);
         total_completed += stats.tasks_completed;
         total_created += stats.tasks_created;
         total_focus_ms += stats.focus_time_ms;
@@ -364,12 +356,12 @@ async fn export_stats_csv(
     file_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let dates = date_range(parse_date(&start_date)?, parse_date(&end_date)?);
     let data = state.0.lock().unwrap();
-    let dates = get_date_range(&start_date, &end_date);
     let mut csv = String::from("날짜,완료된 할 일,생성된 할 일,집중 시간(분),Lap 수,평균 Lap 시간(초)\n");
 
     for date in dates {
-        let stats = compute_daily_stats(&data, &date);
+        let stats = compute_daily_stats(&data, date, &Local);
         let focus_min = stats.focus_time_ms / 60000;
         let avg_lap_sec = stats.avg_lap_time_ms.map(|ms| ms / 1000).unwrap_or(0);
         csv.push_str(&format!(
@@ -469,4 +461,85 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{FixedOffset, Utc};
+
+    fn kst() -> FixedOffset {
+        FixedOffset::east_opt(9 * 3600).unwrap()
+    }
+
+    fn ymd(s: &str) -> NaiveDate {
+        parse_date(s).unwrap()
+    }
+
+    fn ts(tz: &impl TimeZone, s: &str) -> i64 {
+        let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        tz.from_local_datetime(&naive).single().unwrap().timestamp()
+    }
+
+    fn task(created_at: i64, completed_at: Option<i64>) -> TodoItem {
+        TodoItem {
+            id: created_at as u64,
+            text: "t".to_string(),
+            completed: completed_at.is_some(),
+            created_at,
+            completed_at,
+        }
+    }
+
+    #[test]
+    fn day_start_uses_local_midnight() {
+        // KST 2026-09-30 00:00 == UTC 2026-09-29 15:00
+        assert_eq!(day_start(&kst(), ymd("2026-09-30")), ts(&Utc, "2026-09-29 15:00"));
+    }
+
+    #[test]
+    fn early_morning_kst_task_counts_on_same_local_day() {
+        let at = ts(&kst(), "2026-09-30 00:30");
+        let data = AppData {
+            tasks: vec![task(at, Some(at))],
+            ..AppData::default()
+        };
+
+        let today = compute_daily_stats(&data, ymd("2026-09-30"), &kst());
+        let yesterday = compute_daily_stats(&data, ymd("2026-09-29"), &kst());
+        assert_eq!((today.tasks_created, today.tasks_completed), (1, 1));
+        assert_eq!((yesterday.tasks_created, yesterday.tasks_completed), (0, 0));
+
+        // 같은 시각이 UTC 기준으로는 전날이다 (이전 동작)
+        let utc_prev_day = compute_daily_stats(&data, ymd("2026-09-29"), &Utc);
+        assert_eq!(utc_prev_day.tasks_created, 1);
+    }
+
+    #[test]
+    fn day_boundaries_are_half_open() {
+        let midnight = ts(&kst(), "2026-10-01 00:00");
+        let data = AppData {
+            tasks: vec![task(midnight - 1, None), task(midnight, None)],
+            ..AppData::default()
+        };
+        assert_eq!(compute_daily_stats(&data, ymd("2026-09-30"), &kst()).tasks_created, 1);
+        assert_eq!(compute_daily_stats(&data, ymd("2026-10-01"), &kst()).tasks_created, 1);
+    }
+
+    #[test]
+    fn date_range_is_inclusive_and_empty_when_reversed() {
+        let days = date_range(ymd("2026-09-28"), ymd("2026-10-02"));
+        assert_eq!(days.len(), 5);
+        assert_eq!(days.first(), Some(&ymd("2026-09-28")));
+        assert_eq!(days.last(), Some(&ymd("2026-10-02")));
+        assert!(date_range(ymd("2026-10-02"), ymd("2026-09-28")).is_empty());
+    }
+
+    #[test]
+    fn invalid_dates_are_rejected() {
+        assert!(parse_date("").is_err());
+        assert!(parse_date("2026-13-01").is_err());
+        assert!(parse_date("2026-02-30").is_err());
+        assert_eq!(parse_date(" 2026-02-28 ").unwrap(), NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+    }
 }

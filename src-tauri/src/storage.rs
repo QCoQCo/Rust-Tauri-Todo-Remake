@@ -300,7 +300,8 @@ fn compute_hmac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 }
 
 pub fn export_backup(app: &tauri::AppHandle, output_path: &Path, plaintext: &[u8]) -> Result<(), String> {
-    let key = key_for_write(app, &app_data_dir(app)?)?;
+    let dir = app_data_dir(app)?;
+    let key = key_for_write(app, &dir)?;
     let (nonce_bytes, ct) = encrypt(&key, plaintext)?;
 
     let engine = base64::engine::general_purpose::STANDARD;
@@ -345,7 +346,8 @@ pub fn import_backup(app: &tauri::AppHandle, input_path: &Path) -> Result<Vec<u8
     }
 
     // HMAC 검증
-    let key = key_for_write(app, &app_data_dir(app)?)?;
+    let dir = app_data_dir(app)?;
+    let key = key_for_write(app, &dir)?;
     let mut signed_data = Vec::with_capacity(12 + ct.len());
     signed_data.extend_from_slice(&nonce_bytes);
     signed_data.extend_from_slice(&ct);
