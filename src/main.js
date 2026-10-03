@@ -404,8 +404,6 @@ async function exportData() {
         }
         // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
-        console.log('Export path:', path);
-        console.log('Invoking with:', { file_path: path });
         const savedPath = await tauriInvoke('export_data', { file_path: path });
         window.alert(`백업이 저장되었습니다:\n${savedPath}`);
     } catch (e) {
@@ -510,9 +508,10 @@ async function initTodos() {
         const text = input.value.trim();
         if (!text) return;
 
-        const updated = await invokeOrFallback('add_task', { text }, async () => {
+        const addLocal = async () => {
             const local = loadLocalTasks();
-            const id = Date.now();
+            // 같은 밀리초에 추가돼도 기존 id와 겹치지 않게
+            const id = Math.max(Date.now(), ...local.map((x) => Number(x.id) + 1).filter(Number.isFinite));
             const next = [
                 {
                     id,
@@ -525,7 +524,17 @@ async function initTodos() {
             ];
             saveLocalTasks(next);
             return next;
-        });
+        };
+
+        let updated;
+        try {
+            updated = await invokeOrFallback('add_task', { text }, addLocal);
+        } catch (err) {
+            // 입력값은 지우지 않고 남겨 둠
+            window.alert(`할 일 추가 실패: ${err}`);
+            console.error(err);
+            return;
+        }
 
         input.value = '';
         input.focus();

@@ -8,7 +8,7 @@ use chrono::{Days, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{Manager, WindowEvent};
+use tauri::Manager;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TodoItem {
@@ -89,11 +89,36 @@ fn get_tasks(state: tauri::State<'_, AppState>) -> Vec<TodoItem> {
     state.0.lock().unwrap().tasks.clone()
 }
 
+// 프론트 입력창의 maxlength와 맞춤
+const MAX_TASK_TEXT_CHARS: usize = 120;
+
+fn validate_task_text(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("task text is empty".to_string());
+    }
+    if text.chars().count() > MAX_TASK_TEXT_CHARS {
+        return Err(format!("task text exceeds {MAX_TASK_TEXT_CHARS} characters"));
+    }
+    Ok(text.to_string())
+}
+
+// 같은 밀리초에 추가되거나 시계가 뒤로 가도 기존 id와 겹치지 않게 함
+fn next_task_id(tasks: &[TodoItem], now_ms: u64) -> u64 {
+    let max_id = tasks.iter().map(|t| t.id).max().unwrap_or(0);
+    now_ms.max(max_id.saturating_add(1))
+}
+
 #[tauri::command]
-fn add_task(text: String, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Vec<TodoItem> {
+fn add_task(
+    text: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<TodoItem>, String> {
+    let text = validate_task_text(&text)?;
     let mut data = state.0.lock().unwrap();
     let item = TodoItem {
-        id: now_millis(),
+        id: next_task_id(&data.tasks, now_millis()),
         text,
         completed: false,
         created_at: now_secs(),
@@ -106,7 +131,7 @@ fn add_task(text: String, state: tauri::State<'_, AppState>, app: tauri::AppHand
     let snapshot = data.clone();
     drop(data);
     persist(&app, &snapshot);
-    tasks
+    Ok(tasks)
 }
 
 #[tauri::command]
@@ -428,22 +453,6 @@ fn main() {
             }
             Ok(())
         })
-        .on_window_event(|event| {
-            // 창 이벤트를 안전하게 처리하여 크래시 방지
-            // 최소화 이벤트를 포함한 모든 이벤트를 안전하게 처리
-            match event.event() {
-                WindowEvent::CloseRequested { .. } => {
-                    // 창 닫기 이벤트 처리
-                }
-                WindowEvent::Resized { .. } => {
-                    // 크기 변경 이벤트 처리
-                }
-                _ => {
-                    // 기타 모든 이벤트(최소화 포함)는 안전하게 처리
-                    // 이 핸들러가 존재함으로써 null pointer dereference 방지
-                }
-            }
-        })
         .invoke_handler(tauri::generate_handler![
             take_load_failure,
             get_tasks,
@@ -533,6 +542,26 @@ mod tests {
         assert_eq!(days.first(), Some(&ymd("2026-09-28")));
         assert_eq!(days.last(), Some(&ymd("2026-10-02")));
         assert!(date_range(ymd("2026-10-02"), ymd("2026-09-28")).is_empty());
+    }
+
+    #[test]
+    fn task_text_is_trimmed_and_validated() {
+        assert_eq!(validate_task_text("  장보기  ").unwrap(), "장보기");
+        assert!(validate_task_text("").is_err());
+        assert!(validate_task_text(" \t\n ").is_err());
+        assert!(validate_task_text(&"가".repeat(MAX_TASK_TEXT_CHARS)).is_ok());
+        assert!(validate_task_text(&"가".repeat(MAX_TASK_TEXT_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn task_ids_never_collide() {
+        assert_eq!(next_task_id(&[], 1_000), 1_000);
+        let tasks = vec![TodoItem { id: 1_000, ..task(0, None) }];
+        // 같은 밀리초
+        assert_eq!(next_task_id(&tasks, 1_000), 1_001);
+        // 시계가 뒤로 간 경우 / 가져온 데이터의 id가 더 큰 경우
+        assert_eq!(next_task_id(&tasks, 500), 1_001);
+        assert_eq!(next_task_id(&tasks, 2_000), 2_000);
     }
 
     #[test]
