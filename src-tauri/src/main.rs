@@ -2,13 +2,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
+mod stopwatch;
 mod storage;
 
-use chrono::{Days, Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Manager;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use stopwatch::{FocusSession, LapRecord, StopwatchState};
+use tauri::{Manager, RunEvent};
+
+// v2: 할 일 soft delete, 스탑워치 실행 상태, 집중 세션/Lap 기록 추가 (v1 데이터는 그대로 읽힘)
+const DATA_VERSION: u32 = 2;
+
+// 스탑워치 실행 중 체크포인트 저장 주기 (비정상 종료 시 최대 이만큼 기록이 빠짐)
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TodoItem {
@@ -17,12 +25,8 @@ struct TodoItem {
     completed: bool,
     created_at: i64,
     completed_at: Option<i64>, // 완료 시각 (통계용)
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-struct StopwatchState {
-    elapsed_ms: u64,
-    lap_totals_ms: Vec<u64>,
+    #[serde(default)]
+    deleted_at: Option<i64>, // 삭제 시각. 목록에서는 숨기고 통계에는 남긴다
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,15 +34,60 @@ struct AppData {
     v: u32,
     tasks: Vec<TodoItem>,
     stopwatch: Option<StopwatchState>,
+    #[serde(default)]
+    focus_sessions: Vec<FocusSession>,
+    #[serde(default)]
+    lap_records: Vec<LapRecord>,
 }
 
 impl Default for AppData {
     fn default() -> Self {
         Self {
-            v: 1,
+            v: DATA_VERSION,
             tasks: Vec::new(),
             stopwatch: None,
+            focus_sessions: Vec::new(),
+            lap_records: Vec::new(),
         }
+    }
+}
+
+impl AppData {
+    fn visible_tasks(&self) -> Vec<TodoItem> {
+        self.tasks.iter().filter(|t| t.deleted_at.is_none()).cloned().collect()
+    }
+
+    fn stopwatch_view(&self) -> StopwatchState {
+        self.stopwatch.clone().unwrap_or_default()
+    }
+
+    /// 스탑워치 상태를 꺼내 조작 (아직 없으면 새로 만듦)
+    fn with_stopwatch<R>(&mut self, f: impl FnOnce(&mut StopwatchState) -> R) -> R {
+        let sw = self.stopwatch.get_or_insert_with(StopwatchState::default);
+        f(sw)
+    }
+
+    fn stop_stopwatch(&mut self, now_ms: u64) {
+        if let Some(session) = self.with_stopwatch(|sw| sw.stop(now_ms)) {
+            self.focus_sessions.push(session);
+        }
+    }
+
+    /// 실행 중이었다면 그때까지의 집중 시간은 기록하고 초기화
+    fn reset_stopwatch(&mut self, now_ms: u64) {
+        self.stop_stopwatch(now_ms);
+        self.stopwatch = None;
+    }
+
+    /// 정상 종료되지 못해 실행 상태로 남은 스탑워치를 마지막 체크포인트에서 멈춤. 변경이 있으면 true
+    fn recover_interrupted_stopwatch(&mut self, now_ms: u64) -> bool {
+        let Some(sw) = self.stopwatch.as_mut().filter(|sw| sw.is_running()) else {
+            return false;
+        };
+        if let Some(session) = sw.recover_interrupted(now_ms) {
+            self.focus_sessions.push(session);
+        }
+        true
     }
 }
 
@@ -53,6 +102,13 @@ struct LoadFailure {
 }
 
 struct LoadFailureState(Mutex<Option<LoadFailure>>);
+
+// 백업 가져오기 후 화면을 다시 그리는 데 필요한 값
+#[derive(Serialize)]
+struct AppView {
+    tasks: Vec<TodoItem>,
+    stopwatch: StopwatchState,
+}
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -79,6 +135,15 @@ fn persist(app: &tauri::AppHandle, data: &AppData) {
     }
 }
 
+/// 상태를 바꾸고 저장한다. 저장 순서가 뒤바뀌지 않도록 잠금을 쥔 채로 저장
+fn update<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut AppData) -> R) -> R {
+    let state = app.state::<AppState>();
+    let mut data = state.0.lock().unwrap();
+    let out = f(&mut data);
+    persist(app, &data);
+    out
+}
+
 #[tauri::command]
 fn take_load_failure(state: tauri::State<'_, LoadFailureState>) -> Option<LoadFailure> {
     state.0.lock().unwrap().take()
@@ -86,7 +151,7 @@ fn take_load_failure(state: tauri::State<'_, LoadFailureState>) -> Option<LoadFa
 
 #[tauri::command]
 fn get_tasks(state: tauri::State<'_, AppState>) -> Vec<TodoItem> {
-    state.0.lock().unwrap().tasks.clone()
+    state.0.lock().unwrap().visible_tasks()
 }
 
 // 프론트 입력창의 maxlength와 맞춤
@@ -103,94 +168,104 @@ fn validate_task_text(text: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
-// 같은 밀리초에 추가되거나 시계가 뒤로 가도 기존 id와 겹치지 않게 함
+// 같은 밀리초에 추가되거나 시계가 뒤로 가도 기존 id와 겹치지 않게 함 (삭제된 항목 포함)
 fn next_task_id(tasks: &[TodoItem], now_ms: u64) -> u64 {
     let max_id = tasks.iter().map(|t| t.id).max().unwrap_or(0);
     now_ms.max(max_id.saturating_add(1))
 }
 
 #[tauri::command]
-fn add_task(
-    text: String,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<Vec<TodoItem>, String> {
+fn add_task(text: String, app: tauri::AppHandle) -> Result<Vec<TodoItem>, String> {
     let text = validate_task_text(&text)?;
-    let mut data = state.0.lock().unwrap();
-    let item = TodoItem {
-        id: next_task_id(&data.tasks, now_millis()),
-        text,
-        completed: false,
-        created_at: now_secs(),
-        completed_at: None,
-    };
-
-    // 최신이 위로
-    data.tasks.insert(0, item);
-    let tasks = data.tasks.clone();
-    let snapshot = data.clone();
-    drop(data);
-    persist(&app, &snapshot);
-    Ok(tasks)
+    Ok(update(&app, |data| {
+        let item = TodoItem {
+            id: next_task_id(&data.tasks, now_millis()),
+            text,
+            completed: false,
+            created_at: now_secs(),
+            completed_at: None,
+            deleted_at: None,
+        };
+        // 최신이 위로
+        data.tasks.insert(0, item);
+        data.visible_tasks()
+    }))
 }
 
 #[tauri::command]
-fn toggle_task(id: u64, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Vec<TodoItem> {
-    let mut data = state.0.lock().unwrap();
-    if let Some(t) = data.tasks.iter_mut().find(|t| t.id == id) {
-        t.completed = !t.completed;
-        if t.completed {
-            t.completed_at = Some(now_secs());
-        } else {
-            t.completed_at = None;
+fn toggle_task(id: u64, app: tauri::AppHandle) -> Vec<TodoItem> {
+    update(&app, |data| {
+        if let Some(t) = data.tasks.iter_mut().find(|t| t.id == id && t.deleted_at.is_none()) {
+            t.completed = !t.completed;
+            t.completed_at = t.completed.then(now_secs);
         }
-    }
-    let tasks = data.tasks.clone();
-    let snapshot = data.clone();
-    drop(data);
-    persist(&app, &snapshot);
-    tasks
+        data.visible_tasks()
+    })
 }
 
 #[tauri::command]
-fn delete_task(id: u64, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Vec<TodoItem> {
-    let mut data = state.0.lock().unwrap();
-    data.tasks.retain(|t| t.id != id);
-    let tasks = data.tasks.clone();
-    let snapshot = data.clone();
-    drop(data);
-    persist(&app, &snapshot);
-    tasks
+fn delete_task(id: u64, app: tauri::AppHandle) -> Vec<TodoItem> {
+    update(&app, |data| {
+        if let Some(t) = data.tasks.iter_mut().find(|t| t.id == id && t.deleted_at.is_none()) {
+            t.deleted_at = Some(now_secs());
+        }
+        data.visible_tasks()
+    })
 }
 
 #[tauri::command]
-fn get_stopwatch_state(state: tauri::State<'_, AppState>) -> Option<StopwatchState> {
-    state.0.lock().unwrap().stopwatch.clone()
+fn get_stopwatch_state(state: tauri::State<'_, AppState>) -> StopwatchState {
+    state.0.lock().unwrap().stopwatch_view()
 }
 
 #[tauri::command]
-fn set_stopwatch_state(
-    stopwatch: StopwatchState,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Option<StopwatchState> {
-    let mut data = state.0.lock().unwrap();
-    data.stopwatch = Some(stopwatch);
-    let out = data.stopwatch.clone();
-    let snapshot = data.clone();
-    drop(data);
-    persist(&app, &snapshot);
-    out
+fn stopwatch_start(app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        data.with_stopwatch(|sw| sw.start(now_millis()));
+        data.stopwatch_view()
+    })
 }
 
 #[tauri::command]
-fn clear_stopwatch_state(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> bool {
-    let mut data = state.0.lock().unwrap();
-    data.stopwatch = None;
-    let snapshot = data.clone();
-    drop(data);
-    persist(&app, &snapshot);
-    true
+fn stopwatch_stop(app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        data.stop_stopwatch(now_millis());
+        data.stopwatch_view()
+    })
+}
+
+#[tauri::command]
+fn stopwatch_lap(app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        if let Some(lap) = data.with_stopwatch(|sw| sw.lap(now_millis())) {
+            data.lap_records.push(lap);
+        }
+        data.stopwatch_view()
+    })
+}
+
+#[tauri::command]
+fn stopwatch_delete_lap(index: usize, app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        data.with_stopwatch(|sw| sw.delete_lap(index));
+        data.stopwatch_view()
+    })
+}
+
+#[tauri::command]
+fn stopwatch_clear_laps(app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        data.with_stopwatch(|sw| sw.clear_laps());
+        data.stopwatch_view()
+    })
+}
+
+#[tauri::command]
+fn stopwatch_reset(app: tauri::AppHandle) -> StopwatchState {
+    update(&app, |data| {
+        data.reset_stopwatch(now_millis());
+        data.stopwatch_view()
+    })
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -208,46 +283,47 @@ async fn export_data(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn import_data(
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-    file_path: String,
-) -> Result<AppData, String> {
+async fn import_data(app: tauri::AppHandle, file_path: String) -> Result<AppView, String> {
     let path = std::path::PathBuf::from(file_path);
 
     let bytes = storage::import_backup(&app, &path)?;
-    let imported: AppData = serde_json::from_slice(&bytes).map_err(|e| format!("parse error: {e}"))?;
+    let mut imported: AppData = serde_json::from_slice(&bytes).map_err(|e| format!("parse error: {e}"))?;
+    imported.v = DATA_VERSION;
+    // 실행 중에 내보낸 백업이면 내보낸 시점 근처(체크포인트)에서 멈춘 것으로 처리
+    imported.recover_interrupted_stopwatch(now_millis());
 
-    // 상태 업데이트
-    let mut current = state.0.lock().unwrap();
-    *current = imported.clone();
-    drop(current);
-
-    // 즉시 저장
-    persist(&app, &imported);
-    Ok(imported)
+    // 상태를 교체하고 즉시 저장
+    Ok(update(&app, |data| {
+        *data = imported;
+        AppView {
+            tasks: data.visible_tasks(),
+            stopwatch: data.stopwatch_view(),
+        }
+    }))
 }
 
 // --- 통계 관련 구조체 ---
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 struct DailyStats {
     date: String, // YYYY-MM-DD
     tasks_completed: u32,
     tasks_created: u32,
-    focus_time_ms: u64, // 스탑워치 사용 시간 (밀리초)
+    focus_time_ms: u64, // 그날 시작한 집중 세션 합계 (밀리초)
     lap_count: u32,
     avg_lap_time_ms: Option<u64>, // 평균 Lap 시간
+    #[serde(skip)]
+    lap_time_sum_ms: u64, // 기간 전체 평균 계산용
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct WeeklyStats {
+#[derive(Clone, Serialize)]
+struct RangeStats {
     start_date: String, // YYYY-MM-DD
     end_date: String,
     total_tasks_completed: u32,
     total_tasks_created: u32,
     total_focus_time_ms: u64,
     total_lap_count: u32,
-    avg_daily_completion: f64,
+    avg_lap_time_ms: Option<u64>, // 기간 전체 Lap의 평균 (일별 평균의 평균이 아님)
     daily_stats: Vec<DailyStats>,
 }
 
@@ -272,41 +348,39 @@ fn date_range(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     start.iter_days().take_while(|d| *d <= end).collect()
 }
 
+fn average(sum: u64, count: u32) -> Option<u64> {
+    (count > 0).then(|| sum / count as u64)
+}
+
 fn compute_daily_stats<Tz: TimeZone>(data: &AppData, date: NaiveDate, tz: &Tz) -> DailyStats {
     // 하루 길이를 86400초로 가정하지 않고 다음 날 시작 시각까지로 계산 (DST 대응)
     let start_ts = day_start(tz, date);
     let end_ts = date.succ_opt().map_or(i64::MAX, |next| day_start(tz, next));
+    let in_day = |ts: i64| ts >= start_ts && ts < end_ts;
+    let in_day_ms = |ms: u64| in_day((ms / 1000) as i64);
 
+    // 삭제된 할 일도 통계에는 포함
     let tasks_completed = data
         .tasks
         .iter()
-        .filter(|t| {
-            t.completed
-                && t.completed_at.is_some()
-                && t.completed_at.unwrap() >= start_ts
-                && t.completed_at.unwrap() < end_ts
-        })
+        .filter(|t| t.completed && t.completed_at.is_some_and(in_day))
         .count() as u32;
 
-    let tasks_created = data
-        .tasks
+    let tasks_created = data.tasks.iter().filter(|t| in_day(t.created_at)).count() as u32;
+
+    // 자정을 넘긴 세션은 시작한 날로 집계
+    let focus_time_ms = data
+        .focus_sessions
         .iter()
-        .filter(|t| t.created_at >= start_ts && t.created_at < end_ts)
-        .count() as u32;
+        .filter(|s| in_day_ms(s.started_at_ms))
+        .map(|s| s.duration_ms)
+        .sum();
 
-    // 스탑워치 통계는 현재 상태만 있으므로 간단히 처리
-    let (focus_time_ms, lap_count, avg_lap_time_ms) = if let Some(sw) = &data.stopwatch {
-        let lap_count = sw.lap_totals_ms.len() as u32;
-        let avg = if lap_count > 0 {
-            let sum: u64 = sw.lap_totals_ms.iter().sum();
-            Some(sum / lap_count as u64)
-        } else {
-            None
-        };
-        (sw.elapsed_ms, lap_count, avg)
-    } else {
-        (0, 0, None)
-    };
+    let (lap_count, lap_time_sum_ms) = data
+        .lap_records
+        .iter()
+        .filter(|l| in_day_ms(l.at_ms))
+        .fold((0u32, 0u64), |(count, sum), l| (count + 1, sum + l.split_ms));
 
     DailyStats {
         date: date.format("%Y-%m-%d").to_string(),
@@ -314,64 +388,40 @@ fn compute_daily_stats<Tz: TimeZone>(data: &AppData, date: NaiveDate, tz: &Tz) -
         tasks_created,
         focus_time_ms,
         lap_count,
-        avg_lap_time_ms,
+        avg_lap_time_ms: average(lap_time_sum_ms, lap_count),
+        lap_time_sum_ms,
     }
 }
 
-#[tauri::command(rename_all = "snake_case")]
-fn get_daily_stats(
-    date: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DailyStats, String> {
-    let date = parse_date(&date)?;
-    let data = state.0.lock().unwrap();
-    Ok(compute_daily_stats(&data, date, &Local))
-}
+fn compute_range_stats<Tz: TimeZone>(data: &AppData, start: NaiveDate, end: NaiveDate, tz: &Tz) -> RangeStats {
+    let daily_stats: Vec<DailyStats> = date_range(start, end)
+        .into_iter()
+        .map(|date| compute_daily_stats(data, date, tz))
+        .collect();
+    let total_lap_count = daily_stats.iter().map(|d| d.lap_count).sum();
+    let lap_time_sum_ms = daily_stats.iter().map(|d| d.lap_time_sum_ms).sum();
 
-#[tauri::command(rename_all = "snake_case")]
-fn get_weekly_stats(
-    start_date: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<WeeklyStats, String> {
-    let start = parse_date(&start_date)?;
-    let end = start
-        .checked_add_days(Days::new(6))
-        .ok_or_else(|| format!("date out of range: {start_date}"))?;
-    let end_date = end.format("%Y-%m-%d").to_string();
-    let dates = date_range(start, end);
-    let data = state.0.lock().unwrap();
-
-    let mut daily_stats = Vec::new();
-    let mut total_completed = 0u32;
-    let mut total_created = 0u32;
-    let mut total_focus_ms = 0u64;
-    let mut total_laps = 0u32;
-
-    for date in dates {
-        let stats = compute_daily_stats(&data, date, &Local);
-        total_completed += stats.tasks_completed;
-        total_created += stats.tasks_created;
-        total_focus_ms += stats.focus_time_ms;
-        total_laps += stats.lap_count;
-        daily_stats.push(stats);
-    }
-
-    let avg_daily_completion = if daily_stats.len() > 0 {
-        total_completed as f64 / daily_stats.len() as f64
-    } else {
-        0.0
-    };
-
-    Ok(WeeklyStats {
-        start_date,
-        end_date,
-        total_tasks_completed: total_completed,
-        total_tasks_created: total_created,
-        total_focus_time_ms: total_focus_ms,
-        total_lap_count: total_laps,
-        avg_daily_completion,
+    RangeStats {
+        start_date: start.format("%Y-%m-%d").to_string(),
+        end_date: end.format("%Y-%m-%d").to_string(),
+        total_tasks_completed: daily_stats.iter().map(|d| d.tasks_completed).sum(),
+        total_tasks_created: daily_stats.iter().map(|d| d.tasks_created).sum(),
+        total_focus_time_ms: daily_stats.iter().map(|d| d.focus_time_ms).sum(),
+        total_lap_count,
+        avg_lap_time_ms: average(lap_time_sum_ms, total_lap_count),
         daily_stats,
-    })
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn get_range_stats(
+    start_date: String,
+    end_date: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<RangeStats, String> {
+    let (start, end) = (parse_date(&start_date)?, parse_date(&end_date)?);
+    let data = state.0.lock().unwrap();
+    Ok(compute_range_stats(&data, start, end, &Local))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -381,21 +431,20 @@ async fn export_stats_csv(
     file_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let dates = date_range(parse_date(&start_date)?, parse_date(&end_date)?);
-    let data = state.0.lock().unwrap();
+    let (start, end) = (parse_date(&start_date)?, parse_date(&end_date)?);
+    let stats = compute_range_stats(&state.0.lock().unwrap(), start, end, &Local);
     let mut csv = String::from("날짜,완료된 할 일,생성된 할 일,집중 시간(분),Lap 수,평균 Lap 시간(초)\n");
 
-    for date in dates {
-        let stats = compute_daily_stats(&data, date, &Local);
-        let focus_min = stats.focus_time_ms / 60000;
-        let avg_lap_sec = stats.avg_lap_time_ms.map(|ms| ms / 1000).unwrap_or(0);
+    for day in stats.daily_stats {
+        let focus_min = day.focus_time_ms / 60000;
+        let avg_lap_sec = day.avg_lap_time_ms.map(|ms| ms / 1000).unwrap_or(0);
         csv.push_str(&format!(
             "{},{},{},{},{},{}\n",
-            stats.date,
-            stats.tasks_completed,
-            stats.tasks_created,
+            day.date,
+            day.tasks_completed,
+            day.tasks_created,
             focus_min,
-            stats.lap_count,
+            day.lap_count,
             avg_lap_sec
         ));
     }
@@ -406,13 +455,26 @@ async fn export_stats_csv(
         let default_name = format!("todo_stats_{}_{}.csv", start_date, end_date);
         std::path::PathBuf::from(default_name)
     };
-    
+
     std::fs::write(&path, csv.as_bytes()).map_err(|e| format!("CSV write error: {e}"))?;
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 스탑워치가 도는 동안 주기적으로 체크포인트를 저장 (비정상 종료 대비)
+fn spawn_checkpoint_thread(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(CHECKPOINT_INTERVAL);
+        let state = app.state::<AppState>();
+        let mut data = state.0.lock().unwrap();
+        let now = now_millis();
+        if data.stopwatch.as_mut().is_some_and(|sw| sw.checkpoint(now)) {
+            persist(&app, &data);
+        }
+    });
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(AppState(Mutex::new(AppData::default())))
         .manage(LoadFailureState(Mutex::new(None)))
         .setup(|app| {
@@ -426,7 +488,13 @@ fn main() {
                     .transpose()
             });
             match loaded {
-                Ok(Some(data)) => {
+                Ok(Some(mut data)) => {
+                    data.v = DATA_VERSION;
+                    // 지난번에 비정상 종료됐다면 실행 중이던 스탑워치를 마지막 체크포인트에서 멈춤
+                    let recovered = data.recover_interrupted_stopwatch(now_millis());
+                    if recovered {
+                        persist(&handle, &data);
+                    }
                     let state = app.state::<AppState>();
                     let mut guard = state.0.lock().unwrap();
                     *guard = data;
@@ -451,6 +519,7 @@ fn main() {
                     });
                 }
             }
+            spawn_checkpoint_thread(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -460,16 +529,31 @@ fn main() {
             toggle_task,
             delete_task,
             get_stopwatch_state,
-            set_stopwatch_state,
-            clear_stopwatch_state,
+            stopwatch_start,
+            stopwatch_stop,
+            stopwatch_lap,
+            stopwatch_delete_lap,
+            stopwatch_clear_laps,
+            stopwatch_reset,
             export_data,
             import_data,
-            get_daily_stats,
-            get_weekly_stats,
+            get_range_stats,
             export_stats_csv
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| {
+        // 앱 종료 = 스탑워치 일시정지 (종료 시점까지 기록)
+        if let RunEvent::Exit = event {
+            let state = app.state::<AppState>();
+            let mut data = state.0.lock().unwrap();
+            if data.stopwatch.as_ref().is_some_and(StopwatchState::is_running) {
+                data.stop_stopwatch(now_millis());
+                persist(app, &data);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -497,7 +581,91 @@ mod tests {
             completed: completed_at.is_some(),
             created_at,
             completed_at,
+            deleted_at: None,
         }
+    }
+
+    fn ms(tz: &impl TimeZone, s: &str) -> u64 {
+        ts(tz, s) as u64 * 1000
+    }
+
+    #[test]
+    fn deleted_tasks_are_hidden_but_still_counted() {
+        let at = ts(&kst(), "2026-10-01 10:00");
+        let data = AppData {
+            tasks: vec![TodoItem { deleted_at: Some(at + 60), ..task(at, Some(at)) }, task(at + 1, None)],
+            ..AppData::default()
+        };
+        assert_eq!(data.visible_tasks().len(), 1);
+        let stats = compute_daily_stats(&data, ymd("2026-10-01"), &kst());
+        assert_eq!((stats.tasks_created, stats.tasks_completed), (2, 1));
+    }
+
+    #[test]
+    fn focus_and_laps_are_counted_on_their_own_day() {
+        let data = AppData {
+            focus_sessions: vec![
+                FocusSession { started_at_ms: ms(&kst(), "2026-10-01 00:10"), duration_ms: 60_000 },
+                FocusSession { started_at_ms: ms(&kst(), "2026-10-01 23:50"), duration_ms: 30 * 60_000 }, // 자정 넘김
+                FocusSession { started_at_ms: ms(&kst(), "2026-10-02 09:00"), duration_ms: 5_000 },
+            ],
+            lap_records: vec![
+                LapRecord { at_ms: ms(&kst(), "2026-10-01 00:11"), split_ms: 1_000 },
+                LapRecord { at_ms: ms(&kst(), "2026-10-01 00:12"), split_ms: 2_000 },
+                LapRecord { at_ms: ms(&kst(), "2026-10-02 09:00"), split_ms: 6_000 },
+            ],
+            ..AppData::default()
+        };
+
+        let day1 = compute_daily_stats(&data, ymd("2026-10-01"), &kst());
+        assert_eq!(day1.focus_time_ms, 31 * 60_000);
+        assert_eq!((day1.lap_count, day1.avg_lap_time_ms), (2, Some(1_500)));
+
+        let day2 = compute_daily_stats(&data, ymd("2026-10-02"), &kst());
+        assert_eq!(day2.focus_time_ms, 5_000);
+        assert_eq!((day2.lap_count, day2.avg_lap_time_ms), (1, Some(6_000)));
+
+        let empty = compute_daily_stats(&data, ymd("2026-10-03"), &kst());
+        assert_eq!((empty.focus_time_ms, empty.lap_count, empty.avg_lap_time_ms), (0, 0, None));
+
+        let range = compute_range_stats(&data, ymd("2026-10-01"), ymd("2026-10-03"), &kst());
+        assert_eq!(range.daily_stats.len(), 3);
+        assert_eq!(range.total_focus_time_ms, 31 * 60_000 + 5_000);
+        assert_eq!(range.total_lap_count, 3);
+        // 일별 평균의 평균(3_750)이 아니라 전체 Lap의 평균
+        assert_eq!(range.avg_lap_time_ms, Some(3_000));
+    }
+
+    #[test]
+    fn v1_data_loads_with_defaults() {
+        let v1 = r#"{"v":1,"tasks":[{"id":1,"text":"a","completed":false,"created_at":0,"completed_at":null}],
+                     "stopwatch":{"elapsed_ms":5000,"lap_totals_ms":[1000]}}"#;
+        let data: AppData = serde_json::from_str(v1).unwrap();
+        assert_eq!(data.visible_tasks().len(), 1);
+        assert!(data.focus_sessions.is_empty() && data.lap_records.is_empty());
+        assert_eq!(data.stopwatch_view().elapsed_ms, 5000);
+        assert!(!data.stopwatch_view().is_running());
+    }
+
+    #[test]
+    fn interrupted_stopwatch_is_recovered_into_a_session() {
+        let mut data = AppData::default();
+        data.with_stopwatch(|sw| {
+            sw.start(1_000);
+            sw.checkpoint(31_000);
+        });
+        assert!(data.recover_interrupted_stopwatch(500_000));
+        assert_eq!(data.focus_sessions, vec![FocusSession { started_at_ms: 1_000, duration_ms: 30_000 }]);
+        assert!(!data.recover_interrupted_stopwatch(600_000), "nothing left to recover");
+    }
+
+    #[test]
+    fn reset_records_running_time_before_clearing() {
+        let mut data = AppData::default();
+        data.with_stopwatch(|sw| sw.start(0));
+        data.reset_stopwatch(10_000);
+        assert_eq!(data.focus_sessions, vec![FocusSession { started_at_ms: 0, duration_ms: 10_000 }]);
+        assert_eq!(data.stopwatch_view(), StopwatchState::default());
     }
 
     #[test]

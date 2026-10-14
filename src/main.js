@@ -37,21 +37,33 @@ function formatStopwatch(ms) {
 
 const STOPWATCH_STORAGE_KEY = 'todo_app_stopwatch_state_v1';
 
+// 백엔드 StopwatchState와 같은 모양으로 정리 (이전 형식/깨진 값도 허용)
+function normalizeStopwatch(raw) {
+    const s = raw && typeof raw === 'object' ? raw : {};
+    const nonNegative = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    return {
+        elapsed_ms: nonNegative(s.elapsed_ms),
+        lap_totals_ms: Array.isArray(s.lap_totals_ms)
+            ? s.lap_totals_ms.map(Number).filter((n) => Number.isFinite(n) && n >= 0)
+            : [],
+        running_since_ms: s.running_since_ms == null ? null : nonNegative(s.running_since_ms),
+    };
+}
+
+function stopwatchTotal(state, now = Date.now()) {
+    const running = state.running_since_ms == null ? 0 : Math.max(0, now - state.running_since_ms);
+    return state.elapsed_ms + running;
+}
+
 function loadLocalStopwatch() {
     try {
         const raw = localStorage.getItem(STOPWATCH_STORAGE_KEY);
-        const parsed = raw ? JSON.parse(raw) : null;
-        if (!parsed) return null;
-        const elapsed_ms = Number(parsed.elapsed_ms ?? 0);
-        const lap_totals_ms = Array.isArray(parsed.lap_totals_ms)
-            ? parsed.lap_totals_ms.map(Number)
-            : [];
-        return {
-            elapsed_ms: Math.max(0, elapsed_ms),
-            lap_totals_ms: lap_totals_ms.filter((n) => Number.isFinite(n) && n >= 0),
-        };
+        return normalizeStopwatch(raw ? JSON.parse(raw) : null);
     } catch {
-        return null;
+        return normalizeStopwatch(null);
     }
 }
 
@@ -61,6 +73,40 @@ function saveLocalStopwatch(state) {
     } catch {
         // ignore
     }
+}
+
+// Tauri가 없을 때 백엔드 스탑워치 커맨드를 흉내 냄 (통계용 기록은 남기지 않음)
+function runLocalStopwatchCommand(command, args = {}) {
+    let s = loadLocalStopwatch();
+    const now = Date.now();
+    const running = s.running_since_ms != null;
+    switch (command) {
+        case 'stopwatch_start':
+            if (!running) s.running_since_ms = now;
+            break;
+        case 'stopwatch_stop':
+            if (running) s = { ...s, elapsed_ms: stopwatchTotal(s, now), running_since_ms: null };
+            break;
+        case 'stopwatch_lap': {
+            const total = stopwatchTotal(s, now);
+            const last = s.lap_totals_ms.at(-1) ?? 0;
+            if (total > last) s.lap_totals_ms.push(total);
+            break;
+        }
+        case 'stopwatch_delete_lap':
+            s.lap_totals_ms = s.lap_totals_ms.filter((_, idx) => idx !== args.index);
+            break;
+        case 'stopwatch_clear_laps':
+            s.lap_totals_ms = [];
+            break;
+        case 'stopwatch_reset':
+            s = normalizeStopwatch(null);
+            break;
+        default: // get_stopwatch_state
+            return s;
+    }
+    saveLocalStopwatch(s);
+    return s;
 }
 
 async function setupStopwatch() {
@@ -75,24 +121,30 @@ async function setupStopwatch() {
     const lapsEmpty = $('stopwatch-laps-empty');
     const lapsClearBtn = $('stopwatch-laps-clear');
 
-    let running = false;
-    let startAt = 0;
-    let elapsed = 0;
+    // 상태의 주인은 백엔드(또는 localStorage). 화면은 받은 상태를 그리기만 함
+    let state = normalizeStopwatch(null);
+    let ready = false; // 처음 불러오기 전에는 조작 막기
     let timer = null;
-    let lapTotals = [];
 
-    const getCurrentMs = () => elapsed + (running ? Date.now() - startAt : 0);
+    const isRunning = () => state.running_since_ms != null;
 
     const render = () => {
-        timeEl.textContent = formatStopwatch(getCurrentMs());
+        timeEl.textContent = formatStopwatch(stopwatchTotal(state));
     };
 
-    const setStatus = (label) => {
-        statusEl.textContent = label;
+    const renderControls = () => {
+        const running = isRunning();
+        const total = stopwatchTotal(state);
+        startBtn.textContent = running ? '일시정지' : '시작';
+        statusEl.textContent = running ? 'running' : total > 0 ? 'paused' : 'ready';
+        startBtn.disabled = !ready;
+        resetBtn.disabled = !ready;
+        lapBtn.disabled = !ready || (!running && total <= 0);
     };
 
     const renderLaps = () => {
         lapsList.innerHTML = '';
+        const lapTotals = state.lap_totals_ms;
         if (lapTotals.length === 0) {
             lapsEmpty.hidden = false;
             lapsClearBtn.disabled = true;
@@ -140,124 +192,66 @@ async function setupStopwatch() {
         }
     };
 
-    const persistStopwatch = async () => {
-        const snapshot = { elapsed_ms: getCurrentMs(), lap_totals_ms: lapTotals.slice() };
-        await invokeOrFallback('set_stopwatch_state', { stopwatch: snapshot }, async () => {
-            saveLocalStopwatch(snapshot);
-            return snapshot;
-        });
-    };
-
-    const stop = () => {
-        if (!running) return;
-        running = false;
-        elapsed += Date.now() - startAt;
-        startAt = 0;
-        if (timer) clearInterval(timer);
-        timer = null;
-        startBtn.textContent = '시작';
-        setStatus('paused');
-        lapBtn.disabled = getCurrentMs() <= 0;
-        render();
-        persistStopwatch().catch((e) => console.error(e));
-    };
-
-    const start = () => {
-        if (running) return;
-        running = true;
-        startAt = Date.now();
-        timer = setInterval(render, 50);
-        startBtn.textContent = '일시정지';
-        setStatus('running');
-        lapBtn.disabled = false;
-        render();
-    };
-
-    const reset = () => {
-        running = false;
-        if (timer) clearInterval(timer);
-        timer = null;
-        startAt = 0;
-        elapsed = 0;
-        lapTotals = [];
-        startBtn.textContent = '시작';
-        setStatus('ready');
-        lapBtn.disabled = true;
+    const applyState = (next) => {
+        state = normalizeStopwatch(next);
+        if (isRunning() && !timer) timer = setInterval(render, 50);
+        if (!isRunning() && timer) {
+            clearInterval(timer);
+            timer = null;
+        }
         render();
         renderLaps();
-        invokeOrFallback('clear_stopwatch_state', {}, async () => {
-            localStorage.removeItem(STOPWATCH_STORAGE_KEY);
-            return true;
-        }).catch((e) => console.error(e));
+        renderControls();
     };
 
-    const clearLaps = () => {
-        lapTotals = [];
-        renderLaps();
-        persistStopwatch().catch((e) => console.error(e));
-    };
-
-    const deleteLap = (index) => {
-        const i = Number(index);
-        if (!Number.isFinite(i)) return;
-        if (i < 0 || i >= lapTotals.length) return;
-        lapTotals = lapTotals.filter((_, idx) => idx !== i);
-        renderLaps();
-        persistStopwatch().catch((e) => console.error(e));
-    };
-
-    const lap = () => {
-        const current = getCurrentMs();
-        if (current <= 0) return;
-        lapTotals.push(current);
-        renderLaps();
-        persistStopwatch().catch((e) => console.error(e));
+    const send = async (command, args = {}) => {
+        try {
+            const next = await invokeOrFallback(command, args, async () =>
+                runLocalStopwatchCommand(command, args),
+            );
+            applyState(next);
+        } catch (e) {
+            console.error(e);
+            window.alert(`스탑워치 오류: ${e}`);
+        }
     };
 
     toggleBtn.addEventListener('click', () => {
         const isOpen = !panel.hidden;
         panel.hidden = isOpen;
         toggleBtn.setAttribute('aria-expanded', String(!isOpen));
-        if (isOpen) stop();
+        if (isOpen && isRunning()) send('stopwatch_stop');
     });
 
-    startBtn.addEventListener('click', () => {
-        if (running) stop();
-        else start();
-    });
-
-    lapBtn.addEventListener('click', lap);
-    resetBtn.addEventListener('click', reset);
-    lapsClearBtn.addEventListener('click', clearLaps);
+    startBtn.addEventListener('click', () => send(isRunning() ? 'stopwatch_stop' : 'stopwatch_start'));
+    lapBtn.addEventListener('click', () => send('stopwatch_lap'));
+    resetBtn.addEventListener('click', () => send('stopwatch_reset'));
+    lapsClearBtn.addEventListener('click', () => send('stopwatch_clear_laps'));
 
     lapsList.addEventListener('click', (e) => {
         const btn = e.target?.closest?.('[data-lap-index]');
-        const idx = btn?.getAttribute?.('data-lap-index');
-        if (idx == null) return;
-        deleteLap(idx);
+        const idx = Number(btn?.getAttribute?.('data-lap-index'));
+        if (!btn || !Number.isInteger(idx)) return;
+        send('stopwatch_delete_lap', { index: idx });
     });
 
-    render();
-    renderLaps();
-    lapBtn.disabled = true;
-
-    // 초기 로드(tauri 우선)
-    const loaded = await invokeOrFallback('get_stopwatch_state', {}, async () =>
-        loadLocalStopwatch(),
-    );
-    if (loaded && typeof loaded === 'object') {
-        elapsed = Number(loaded.elapsed_ms ?? 0) || 0;
-        lapTotals = Array.isArray(loaded.lap_totals_ms)
-            ? loaded.lap_totals_ms.map(Number).filter((n) => Number.isFinite(n) && n >= 0)
-            : [];
-        render();
-        renderLaps();
-        lapBtn.disabled = elapsed <= 0;
-        if (typeof tauriInvoke !== 'function') {
-            saveLocalStopwatch({ elapsed_ms: elapsed, lap_totals_ms: lapTotals.slice() });
-        }
+    // Tauri 앱은 종료 시 백엔드가 일시정지 처리. 브라우저(localStorage)에서는 페이지를 떠날 때 멈춤
+    if (typeof tauriInvoke !== 'function') {
+        window.addEventListener('pagehide', () => {
+            if (isRunning()) runLocalStopwatchCommand('stopwatch_stop');
+        });
     }
+
+    renderControls();
+    await send('get_stopwatch_state');
+    ready = true;
+    renderControls();
+
+    return { applyState };
 }
+
+// 백업 가져오기 후 스탑워치 화면 갱신용 (setupStopwatch가 끝나면 채워짐)
+let stopwatchUi = null;
 
 // --- Todo (Tauri 우선, 없으면 localStorage fallback) ---
 const STORAGE_KEY = 'todo_app_tasks_v1';
@@ -432,30 +426,11 @@ async function importData() {
         }
         // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
+        // 백엔드가 상태 교체와 저장을 끝낸 뒤 화면에 필요한 값만 돌려줌
         const imported = await tauriInvoke('import_data', { file_path: path });
-        if (imported && imported.tasks) {
-            renderTasks(imported.tasks);
-            if (imported.stopwatch) {
-                // 스탑워치 상태도 복원 (선택적)
-                const stopwatchState = imported.stopwatch;
-                await invokeOrFallback(
-                    'set_stopwatch_state',
-                    { stopwatch: stopwatchState },
-                    async () => {
-                        saveLocalStopwatch({
-                            elapsed_ms: stopwatchState.elapsed_ms,
-                            lap_totals_ms: stopwatchState.lap_totals_ms,
-                        });
-                        return stopwatchState;
-                    },
-                );
-                // 스탑워치 UI 새로고침을 위해 페이지 리로드 또는 상태 동기화
-                location.reload();
-            } else {
-                renderTasks(imported.tasks);
-            }
-            window.alert('백업이 성공적으로 가져와졌습니다.');
-        }
+        renderTasks(imported.tasks);
+        stopwatchUi?.applyState(imported.stopwatch);
+        window.alert('백업이 성공적으로 가져와졌습니다.');
     } catch (e) {
         if (String(e).includes('cancelled') || String(e).includes('user cancelled')) {
             return; // 사용자가 취소
@@ -572,6 +547,32 @@ function parseLocalYmd(ymd) {
     return new Date(y, m - 1, d);
 }
 
+// get_range_stats와 같은 모양의 빈 통계 (Tauri가 없을 때)
+function emptyRangeStats(startDate, endDate) {
+    const daily_stats = [];
+    const end = parseLocalYmd(endDate);
+    for (let d = parseLocalYmd(startDate); d <= end; d.setDate(d.getDate() + 1)) {
+        daily_stats.push({
+            date: toLocalYmd(d),
+            tasks_completed: 0,
+            tasks_created: 0,
+            focus_time_ms: 0,
+            lap_count: 0,
+            avg_lap_time_ms: null,
+        });
+    }
+    return {
+        start_date: startDate,
+        end_date: endDate,
+        total_tasks_completed: 0,
+        total_tasks_created: 0,
+        total_focus_time_ms: 0,
+        total_lap_count: 0,
+        avg_lap_time_ms: null,
+        daily_stats,
+    };
+}
+
 async function setupStats() {
     const toggleBtn = document.getElementById('toggle-stats');
     const panel = document.getElementById('stats-panel');
@@ -628,56 +629,20 @@ async function setupStats() {
         const { startDate, endDate } = range;
 
         try {
-            // 일별 통계를 수집
-            const dates = [];
-            const end = parseLocalYmd(endDate);
-            for (let d = parseLocalYmd(startDate); d <= end; d.setDate(d.getDate() + 1)) {
-                dates.push(toLocalYmd(d));
-            }
-
-            let totalCompleted = 0;
-            let totalCreated = 0;
-            let totalFocusMs = 0;
-            let totalLaps = 0;
-            let lapTimes = [];
-
-            const dailyStats = [];
-            for (const date of dates) {
-                const stats = await invokeOrFallback(
-                    'get_daily_stats',
-                    { date },
-                    async () => {
-                        return {
-                            tasks_completed: 0,
-                            tasks_created: 0,
-                            focus_time_ms: 0,
-                            lap_count: 0,
-                            avg_lap_time_ms: null,
-                        };
-                    },
-                );
-                dailyStats.push({ date, ...stats });
-                totalCompleted += stats.tasks_completed || 0;
-                totalCreated += stats.tasks_created || 0;
-                totalFocusMs += stats.focus_time_ms || 0;
-                totalLaps += stats.lap_count || 0;
-                if (stats.avg_lap_time_ms) {
-                    lapTimes.push(stats.avg_lap_time_ms);
-                }
-            }
-
-            const avgLapMs =
-                lapTimes.length > 0
-                    ? lapTimes.reduce((a, b) => a + b, 0) / lapTimes.length
-                    : null;
+            // 기간 전체를 한 번에 조회 (Tauri가 없으면 0으로 채운 빈 통계)
+            const stats = await invokeOrFallback(
+                'get_range_stats',
+                { start_date: startDate, end_date: endDate },
+                async () => emptyRangeStats(startDate, endDate),
+            );
+            const dailyStats = stats.daily_stats;
 
             // UI 업데이트
-            document.getElementById('stat-completed').textContent = String(totalCompleted);
-            document.getElementById('stat-created').textContent = String(totalCreated);
-            document.getElementById('stat-focus').textContent = formatMsToTime(totalFocusMs);
-            document.getElementById('stat-avg-lap').textContent = avgLapMs
-                ? `${formatMsToSec(avgLapMs)}초`
-                : '-';
+            document.getElementById('stat-completed').textContent = String(stats.total_tasks_completed);
+            document.getElementById('stat-created').textContent = String(stats.total_tasks_created);
+            document.getElementById('stat-focus').textContent = formatMsToTime(stats.total_focus_time_ms);
+            document.getElementById('stat-avg-lap').textContent =
+                stats.avg_lap_time_ms == null ? '-' : `${formatMsToSec(stats.avg_lap_time_ms)}초`;
 
             // 차트 데이터 준비
             const labels = dailyStats.map((s) => {
@@ -892,7 +857,11 @@ async function reportLoadFailure() {
 }
 
 startClock();
-setupStopwatch().catch((e) => console.error(e));
+setupStopwatch()
+    .then((ui) => {
+        stopwatchUi = ui;
+    })
+    .catch((e) => console.error(e));
 initTodos().catch((e) => console.error(e));
 setupStats().catch((e) => console.error(e));
 reportLoadFailure().catch((e) => console.error(e));
