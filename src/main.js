@@ -381,12 +381,78 @@ function renderTasks(tasks) {
     });
 }
 
+// 백엔드 storage::MIN_BACKUP_PASSWORD_CHARS와 같은 값
+const MIN_BACKUP_PASSWORD_CHARS = 8;
+
+// 백업 비밀번호 입력 창. 확인하면 비밀번호, 취소하면 null
+function askBackupPassword({ title, description, confirm = false, error = '' }) {
+    const dialog = $('password-dialog');
+    const form = $('password-form');
+    const input = $('password-input');
+    const confirmInput = $('password-confirm');
+    const errorEl = $('password-error');
+    const cancelBtn = $('password-cancel');
+
+    $('password-title').textContent = title;
+    $('password-desc').textContent = description;
+    input.value = '';
+    input.autocomplete = confirm ? 'new-password' : 'current-password';
+    confirmInput.value = '';
+    confirmInput.hidden = !confirm;
+    const showError = (message) => {
+        errorEl.textContent = message;
+        errorEl.hidden = !message;
+    };
+    showError(error);
+
+    return new Promise((resolve) => {
+        const finish = (value) => {
+            form.removeEventListener('submit', onSubmit);
+            dialog.removeEventListener('cancel', onCancel);
+            cancelBtn.removeEventListener('click', onCancel);
+            input.value = '';
+            confirmInput.value = '';
+            dialog.close();
+            resolve(value);
+        };
+        const onSubmit = (e) => {
+            e.preventDefault();
+            const password = input.value;
+            if ([...password].length < MIN_BACKUP_PASSWORD_CHARS) {
+                showError(`비밀번호는 ${MIN_BACKUP_PASSWORD_CHARS}자 이상이어야 합니다.`);
+            } else if (confirm && password !== confirmInput.value) {
+                showError('비밀번호 확인이 일치하지 않습니다.');
+            } else {
+                finish(password);
+            }
+        };
+        // 취소 버튼과 Esc 키
+        const onCancel = (e) => {
+            e.preventDefault();
+            finish(null);
+        };
+        form.addEventListener('submit', onSubmit);
+        dialog.addEventListener('cancel', onCancel);
+        cancelBtn.addEventListener('click', onCancel);
+        dialog.showModal();
+        input.focus();
+    });
+}
+
 async function exportData() {
     if (typeof tauriInvoke !== 'function' || !tauriDialog) {
         window.alert('Tauri 환경에서만 백업 내보내기가 가능합니다.');
         return;
     }
     try {
+        const password = await askBackupPassword({
+            title: '백업 비밀번호 설정',
+            description:
+                '이 비밀번호로 백업을 암호화합니다. 다른 PC에서도 이 비밀번호로 복원할 수 있으며, 잊어버리면 복원할 수 없습니다.',
+            confirm: true,
+        });
+        if (password == null) return; // 사용자가 취소
+
         const timestamp = Math.floor(Date.now() / 1000);
         const defaultName = `todo_backup_${timestamp}.json`;
         const filePath = await tauriDialog.save({
@@ -398,7 +464,7 @@ async function exportData() {
         }
         // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
-        const savedPath = await tauriInvoke('export_data', { file_path: path });
+        const savedPath = await tauriInvoke('export_data', { file_path: path, password });
         window.alert(`백업이 저장되었습니다:\n${savedPath}`);
     } catch (e) {
         if (String(e).includes('cancelled') || String(e).includes('user cancelled')) {
@@ -426,8 +492,31 @@ async function importData() {
         }
         // Tauri v1은 배열을 반환할 수 있으므로 첫 번째 요소 사용
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
-        // 백엔드가 상태 교체와 저장을 끝낸 뒤 화면에 필요한 값만 돌려줌
-        const imported = await tauriInvoke('import_data', { file_path: path });
+
+        // 예전(v1) 백업은 이 기기의 키로 열리므로 비밀번호를 묻지 않음
+        const needsPassword = await tauriInvoke('backup_needs_password', { file_path: path });
+        let error = '';
+        let imported;
+        for (;;) {
+            let password = null;
+            if (needsPassword) {
+                password = await askBackupPassword({
+                    title: '백업 비밀번호',
+                    description: '백업을 만들 때 설정한 비밀번호를 입력하세요.',
+                    error,
+                });
+                if (password == null) return; // 사용자가 취소
+            }
+            try {
+                // 백엔드가 상태 교체와 저장을 끝낸 뒤 화면에 필요한 값만 돌려줌
+                imported = await tauriInvoke('import_data', { file_path: path, password });
+                break;
+            } catch (e) {
+                // 비밀번호가 틀리면 다시 묻기
+                if (!needsPassword || !String(e).includes('wrong password')) throw e;
+                error = '비밀번호가 틀렸거나 백업 파일이 손상되었습니다.';
+            }
+        }
         renderTasks(imported.tasks);
         stopwatchUi?.applyState(imported.stopwatch);
         window.alert('백업이 성공적으로 가져와졌습니다.');

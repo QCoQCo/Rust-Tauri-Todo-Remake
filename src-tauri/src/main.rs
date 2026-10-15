@@ -271,22 +271,31 @@ fn stopwatch_reset(app: tauri::AppHandle) -> StopwatchState {
 #[tauri::command(rename_all = "snake_case")]
 async fn export_data(
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
     file_path: String,
+    password: String,
 ) -> Result<String, String> {
     let data = state.0.lock().unwrap().clone();
     let bytes = serde_json::to_vec(&data).map_err(|e| format!("serialize error: {e}"))?;
 
     let path = std::path::PathBuf::from(file_path);
-    storage::export_backup(&app, &path, &bytes)?;
+    storage::export_backup(&path, &bytes, &password)?;
     Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn import_data(app: tauri::AppHandle, file_path: String) -> Result<AppView, String> {
+async fn backup_needs_password(file_path: String) -> Result<bool, String> {
+    storage::backup_needs_password(std::path::Path::new(&file_path))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn import_data(
+    app: tauri::AppHandle,
+    file_path: String,
+    password: Option<String>,
+) -> Result<AppView, String> {
     let path = std::path::PathBuf::from(file_path);
 
-    let bytes = storage::import_backup(&app, &path)?;
+    let bytes = storage::import_backup(&app, &path, password.as_deref())?;
     let mut imported: AppData = serde_json::from_slice(&bytes).map_err(|e| format!("parse error: {e}"))?;
     imported.v = DATA_VERSION;
     // 실행 중에 내보낸 백업이면 내보낸 시점 근처(체크포인트)에서 멈춘 것으로 처리
@@ -536,6 +545,7 @@ fn main() {
             stopwatch_clear_laps,
             stopwatch_reset,
             export_data,
+            backup_needs_password,
             import_data,
             get_range_stats,
             export_stats_csv

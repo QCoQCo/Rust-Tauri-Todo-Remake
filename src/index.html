@@ -219,6 +219,33 @@
             </main>
         </div>
 
+        <dialog id="password-dialog" class="dialog" aria-labelledby="password-title">
+            <form id="password-form" class="dialog__form">
+                <h2 id="password-title" class="card__title">백업 비밀번호</h2>
+                <p id="password-desc" class="dialog__desc"></p>
+                <input
+                    id="password-input"
+                    class="input"
+                    type="password"
+                    placeholder="비밀번호 (8자 이상)"
+                    aria-label="비밀번호"
+                />
+                <input
+                    id="password-confirm"
+                    class="input"
+                    type="password"
+                    autocomplete="new-password"
+                    placeholder="비밀번호 확인"
+                    aria-label="비밀번호 확인"
+                />
+                <p id="password-error" class="dialog__error" role="alert" hidden></p>
+                <div class="dialog__actions">
+                    <button id="password-cancel" class="btn" type="button">취소</button>
+                    <button class="btn btn--primary" type="submit">확인</button>
+                </div>
+            </form>
+        </dialog>
+
         <script type="module" src="./main.js"></script>
     </body>
 </html>
