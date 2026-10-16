@@ -2,7 +2,7 @@
 name = "todo-app"
 version = "0.1.0"
 description = "A Todo App"
-authors = ["you"]
+authors = ["QCoQCo"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -21,7 +21,15 @@ keyring = "2"
 hmac = "0.12"
 sha2 = "0.10"
 chrono = "0.4"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+# Argon2는 디버그 빌드에서 매우 느려서 (백업 비밀번호 키 생성) 개발 중에도 최적화
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
