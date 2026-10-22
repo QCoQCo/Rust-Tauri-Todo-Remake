@@ -88,19 +88,82 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 앱 데이터 폴더와 데이터·키 파일은 본인 계정만 접근하도록 (Unix 권한).
+/// 키가 데이터 옆에 있으므로 이 권한이 다른 사용자 계정으로부터의 보호 범위다
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(PRIVATE_DIR_MODE);
+    }
+    builder.create(dir).map_err(|e| format!("failed to create data dir: {e}"))
+}
+
+fn set_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.is_dir() { PRIVATE_DIR_MODE } else { PRIVATE_FILE_MODE };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path; // Windows는 앱 데이터 폴더가 이미 사용자별 ACL로 보호됨
+    Ok(())
+}
+
+/// 이전 버전이 기본 권한(0644/0755)으로 만든 파일을 바로잡는다
+fn restrict_existing_permissions(dir: &Path) {
+    for path in [dir.to_path_buf(), dir.join(DATA_FILENAME), dir.join(KEY_FILENAME)] {
+        if path.exists() {
+            if let Err(e) = set_private(&path) {
+                eprintln!("failed to restrict permissions ({}): {e}", path.display());
+            }
+        }
+    }
+}
+
+/// 사용자가 고른 위치에 쓰는 파일 (백업 등): 기본 권한
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_with(path, bytes, false)
+}
+
+/// 앱 데이터 폴더의 데이터·키 파일: 본인만 읽기/쓰기
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_with(path, bytes, true)
+}
+
 /// 임시 파일에 쓰고 디스크에 flush한 뒤 rename으로 교체한다.
 /// 쓰는 도중 앱이 죽어도 기존 파일은 온전히 남는다.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    ensure_parent_dir(path)?;
+fn write_atomic_with(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    match path.parent() {
+        Some(parent) if private => create_private_dir(parent)?,
+        _ => ensure_parent_dir(path)?,
+    }
     let mut tmp_name = path
         .file_name()
         .ok_or_else(|| format!("invalid file path: {}", path.display()))?
         .to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
+    // 지난번에 남은 임시 파일의 권한을 이어받지 않도록 새로 만든다
+    let _ = fs::remove_file(&tmp);
 
     let result = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(PRIVATE_FILE_MODE);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         fs::rename(&tmp, path)
@@ -127,6 +190,10 @@ fn quarantine(path: &Path, label: &str) -> Result<PathBuf, String> {
         n += 1;
     }
     fs::rename(path, &target).map_err(|e| format!("failed to preserve {}: {e}", path.display()))?;
+    // 보존본에도 키·데이터가 들어 있으므로 본인만 읽을 수 있게
+    if let Err(e) = set_private(&target) {
+        eprintln!("failed to restrict permissions ({}): {e}", target.display());
+    }
     Ok(target)
 }
 
@@ -173,7 +240,7 @@ fn replace_fallback_key(dir: &Path, key: &[u8; 32]) -> Result<(), String> {
         quarantine(&path, "old")?;
     }
     let engine = base64::engine::general_purpose::STANDARD;
-    write_atomic(&path, engine.encode(key).as_bytes())
+    write_private(&path, engine.encode(key).as_bytes())
 }
 
 /// 저장에 쓸 키를 찾는다. 키가 없으면 새로 만들되,
@@ -292,11 +359,12 @@ fn write_data_file(dir: &Path, key: &[u8; 32], plaintext: &[u8]) -> Result<(), S
         hmac_b64: None, // 로컬 저장에는 HMAC 불필요 (AES-GCM이 이미 인증 제공)
     };
     let out = serde_json::to_string(&env).map_err(|e| format!("envelope serialize error: {e}"))?;
-    write_atomic(&dir.join(DATA_FILENAME), out.as_bytes())
+    write_private(&dir.join(DATA_FILENAME), out.as_bytes())
 }
 
 pub fn load_encrypted(app: &tauri::AppHandle) -> Result<Option<Vec<u8>>, String> {
     let dir = app_data_dir(app)?;
+    restrict_existing_permissions(&dir);
     load_from_dir(&dir, || read_keyring_key(app))
 }
 
@@ -548,6 +616,64 @@ mod tests {
     fn existing_keyring_entry_is_not_overwritten_when_unavailable() {
         let dir = temp_dir("keyringunavailable");
         key_for_write_in_dir(&dir, || KeyringLookup::Unavailable, |_| panic!("must not overwrite keyring")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_and_key_files_are_private() {
+        let root = temp_dir("private");
+        let dir = root.join("app-data"); // 아직 없는 폴더
+        let key = key_for_write_in_dir(&dir, || KeyringLookup::NoEntry, |_| {}).unwrap();
+        write_data_file(&dir, &key, b"x").unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(DATA_FILENAME)), 0o600);
+        assert_eq!(mode(&dir.join(KEY_FILENAME)), 0o600);
+
+        // 백업처럼 사용자가 고른 위치의 파일은 기본 권한 유지
+        let backup = root.join("backup.json");
+        write_atomic(&backup, b"x").unwrap();
+        assert_ne!(mode(&backup), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_from_old_versions_are_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("restrict");
+        for name in [DATA_FILENAME, KEY_FILENAME] {
+            fs::write(dir.join(name), b"x").unwrap();
+            fs::set_permissions(dir.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_existing_permissions(&dir);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(DATA_FILENAME)), 0o600);
+        assert_eq!(mode(&dir.join(KEY_FILENAME)), 0o600);
+
+        // 보존본도 본인만
+        fs::set_permissions(dir.join(DATA_FILENAME), fs::Permissions::from_mode(0o644)).unwrap();
+        let preserved = quarantine(&dir.join(DATA_FILENAME), "corrupt").unwrap();
+        assert_eq!(mode(&preserved), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_tmp_file_permissions_are_not_inherited() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("staletmp");
+        let tmp = dir.join(format!("{DATA_FILENAME}.tmp"));
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).unwrap();
+        write_private(&dir.join(DATA_FILENAME), b"fresh").unwrap();
+        assert_eq!(mode(&dir.join(DATA_FILENAME)), 0o600);
+        assert!(!tmp.exists());
     }
 
     const PASSWORD: &str = "correct horse";

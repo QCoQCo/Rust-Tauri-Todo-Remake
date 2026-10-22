@@ -347,31 +347,43 @@ function renderTasks(tasks) {
         del.textContent = '삭제';
 
         cb.addEventListener('change', async () => {
-            const updated = await invokeOrFallback('toggle_task', { id: t.id }, async () => {
-                const local = loadLocalTasks().map((x) => {
-                    if (x.id === t.id) {
-                        const newCompleted = !x.completed;
-                        return {
-                            ...x,
-                            completed: newCompleted,
-                            completed_at: newCompleted ? Math.floor(Date.now() / 1000) : null,
-                        };
-                    }
-                    return x;
+            try {
+                const updated = await invokeOrFallback('toggle_task', { id: t.id }, async () => {
+                    const local = loadLocalTasks().map((x) => {
+                        if (x.id === t.id) {
+                            const newCompleted = !x.completed;
+                            return {
+                                ...x,
+                                completed: newCompleted,
+                                completed_at: newCompleted ? Math.floor(Date.now() / 1000) : null,
+                            };
+                        }
+                        return x;
+                    });
+                    saveLocalTasks(local);
+                    return local;
                 });
-                saveLocalTasks(local);
-                return local;
-            });
-            renderTasks(updated);
+                renderTasks(updated);
+            } catch (e) {
+                window.alert(`할 일 상태 변경 실패: ${e}`);
+                console.error(e);
+                // 백엔드는 변경을 되돌렸으므로 체크박스도 원래대로
+                renderTasks(currentTasks);
+            }
         });
 
         del.addEventListener('click', async () => {
-            const updated = await invokeOrFallback('delete_task', { id: t.id }, async () => {
-                const local = loadLocalTasks().filter((x) => x.id !== t.id);
-                saveLocalTasks(local);
-                return local;
-            });
-            renderTasks(updated);
+            try {
+                const updated = await invokeOrFallback('delete_task', { id: t.id }, async () => {
+                    const local = loadLocalTasks().filter((x) => x.id !== t.id);
+                    saveLocalTasks(local);
+                    return local;
+                });
+                renderTasks(updated);
+            } catch (e) {
+                window.alert(`할 일 삭제 실패: ${e}`);
+                console.error(e);
+            }
         });
 
         li.appendChild(cb);
@@ -940,7 +952,7 @@ async function reportLoadFailure() {
         lines.push(`기존 데이터 파일은 삭제하지 않고 다음 위치에 보존했습니다:\n${failure.preserved_path}`);
     }
     if (failure.writes_blocked) {
-        lines.push('기존 데이터 파일을 보존하지 못해, 이번 실행에서는 변경 사항이 저장되지 않습니다.');
+        lines.push('기존 데이터 파일을 보존하지 못해, 덮어쓰지 않도록 이번 실행에서는 데이터를 변경할 수 없습니다.');
     }
     window.alert(lines.join('\n\n'));
 }

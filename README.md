@@ -24,9 +24,9 @@ Tauri와 Vanilla JavaScript로 만든 **데스크톱 투두·스탑워치·통�
 | 기능 | 설명 |
 |------|------|
 | **할 일** | 할 일 추가·완료 토글·삭제, 필터(전체/진행중/완료), 실시간 개수 표시 |
-| **스탑워치** | 시작/일시정지, 랩 기록, 랩별 구간 시간·삭제, 초기화. 상태는 앱과 함께 저장됨 |
-| **통계** | 기간 선택 후 일별·주간 통계: 완료/생성 할 일 수, 포커스 시간, 랩 수. Chart.js 막대·선 차트, CSV 내보내기 |
-| **백업** | Tauri 환경에서만: 암호화된 JSON 파일로 내보내기·가져오기(할 일 + 스탑워치 상태) |
+| **스탑워치** | 시작/일시정지, 랩 기록, 랩별 구간 시간·삭제, 초기화. 실행 상태까지 저장되며, 실행 중에 앱을 종료하면 그 시점에 일시정지됨 |
+| **통계** | 기간 선택 후 일별 통계: 완료/생성 할 일 수, 집중 시간(스탑워치 세션 기록), 랩 수·평균 랩 시간. 날짜는 로컬 시간대 기준이며, 삭제한 할 일도 통계에 남음. Chart.js 막대·선 차트, CSV 내보내기 |
+| **백업** | Tauri 환경에서만: 비밀번호로 암호화한 JSON 파일로 내보내기·가져오기(할 일 + 스탑워치 + 통계 기록). 같은 비밀번호로 다른 PC에서도 복원 가능 |
 | **실시간 시계** | 상단 헤더에 현재 요일·시각 표시 |
 
 - Tauri가 없을 때(예: 브라우저에서 `index.html` 직접 열기)에는 **localStorage**로 할 일·스탑워치 상태를 저장하며, 백업/통계 일부는 Tauri 전용입니다.
@@ -35,10 +35,10 @@ Tauri와 Vanilla JavaScript로 만든 **데스크톱 투두·스탑워치·통�
 
 ### 기술 스택
 
-- **프론트엔드**: HTML5, CSS3, Vanilla JavaScript (ES Module), [Chart.js](https://www.chartjs.org/) (통계 차트)
+- **프론트엔드**: HTML5, CSS3, Vanilla JavaScript (ES Module), [Chart.js](https://www.chartjs.org/) (통계 차트, `src/vendor/`에 포함되어 오프라인에서도 동작)
 - **데스크톱·백엔드**: [Tauri v1](https://tauri.app/) (Rust)
-- **데이터 저장**: Rust 측에서 **AES-256-GCM** 암호화 후 앱 데이터 디렉터리에 저장. 암호화 키는 OS 키체인(keyring) 우선 사용, 실패 시 로컬 fallback 파일 사용
-- **백업 파일**: 내보내기 시 동일 키로 암호화 + HMAC 서명으로 변조 검증
+- **데이터 저장**: Rust 측에서 **AES-256-GCM** 암호화 후 앱 데이터 디렉터리에 저장. 암호화 키는 같은 디렉터리의 `key_fallback.b64`를 우선 사용하고(키체인 비밀번호 창 방지), 없으면 OS 키체인(keyring)에서 가져옴
+- **백업 파일**: 사용자 비밀번호에서 **Argon2id**로 만든 키로 AES-256-GCM 암호화. 이전 형식(v1: 기기 키 + HMAC) 백업도 만든 기기에서는 가져올 수 있음
 
 ---
 
@@ -75,16 +75,22 @@ todo_app/
 │   ├── index.html            # 단일 페이지: 할 일, 필터, 스탑워치, 통계 패널
 │   ├── main.js               # 할 일/스탑워치/통계/백업 UI·로직, Tauri invoke
 │   ├── styles.css            # 스타일
+│   ├── vendor/chart.umd.js   # Chart.js 4.4.0 (로컬 포함, CSP로 외부 스크립트 차단)
 │   └── assets/               # 정적 에셋
 ├── src-tauri/                # Tauri (Rust) 앱
-│   ├── Cargo.toml            # Rust 의존성 (tauri, serde, aes-gcm, keyring, chrono 등)
+│   ├── Cargo.toml            # Rust 의존성 (tauri, serde, aes-gcm, argon2, keyring, chrono 등)
 │   ├── tauri.conf.json       # 창 크기, identifier, 허용 API 등
 │   ├── icons/
 │   └── src/
-│       ├── main.rs           # 진입점, Tauri commands: get_tasks, add_task, toggle_task,
-│       │                     # delete_task, get/set/clear_stopwatch_state, export_data,
-│       │                     # import_data, get_daily_stats, get_weekly_stats, export_stats_csv
-│       └── storage.rs        # AES-256-GCM 암호화 저장/로드, 키체인·fallback 키, 백업 내보내기/가져오기
+│       ├── main.rs           # 진입점, 데이터 모델, 통계, Tauri commands:
+│       │                     #   할 일: get_tasks, add_task, toggle_task, delete_task
+│       │                     #   스탑워치: get_stopwatch_state, stopwatch_start/stop/lap/
+│       │                     #             delete_lap/clear_laps/reset
+│       │                     #   백업: export_data, backup_needs_password, import_data
+│       │                     #   통계: get_range_stats, export_stats_csv
+│       │                     #   기타: take_load_failure (시작 시 로드 실패 알림)
+│       ├── stopwatch.rs      # 스탑워치 상태와 집중 세션·랩 기록
+│       └── storage.rs        # 암호화 저장/로드(원자적 쓰기), 키 관리, 백업 v1/v2
 ├── package.json              # scripts: tauri, tauri dev/build
 └── README.md
 ```
@@ -94,8 +100,15 @@ todo_app/
 ### 데이터 저장 위치 (Tauri 앱)
 
 - **앱 데이터**: OS별 앱 데이터 디렉터리 내 `app_data.enc.json` (암호화된 JSON).
-- **암호화 키**: OS 키체인(서비스명 = bundle identifier) 또는 동일 디렉터리의 `key_fallback.b64`.
-- **백업 파일**: 사용자가 지정한 경로에 저장되는 `.json` 파일(동일 형식·HMAC 서명 포함).
+- **암호화 키**: 같은 디렉터리의 `key_fallback.b64`. 없으면 OS 키체인(서비스명 = bundle identifier)에서 가져와 이 파일에 저장.
+- **백업 파일**: 사용자가 지정한 경로에 저장되는 `.json` 파일(비밀번호 기반 암호화).
+- **보존 파일**: 저장 데이터를 불러오지 못하면 원본을 `app_data.enc.json.corrupt-<시각>`으로, 교체된 키는 `key_fallback.b64.old-<시각>`으로 지우지 않고 남겨 둠.
+
+#### 보호 범위
+
+- 암호화 키가 데이터 파일과 같은 디렉터리에 있으므로, 로컬 암호화는 **같은 사용자 계정의 프로그램으로부터 데이터를 보호하지 않습니다.**
+- 대신 macOS/Linux에서는 앱 데이터 디렉터리(0700)와 데이터·키 파일(0600)을 본인 계정만 접근할 수 있게 하여 **다른 사용자 계정으로부터** 보호합니다. Windows에서는 사용자별 앱 데이터 폴더 권한에 따릅니다.
+- 백업 파일은 비밀번호로 암호화되므로 키 파일 없이 단독으로 보관·이동해도 됩니다. 비밀번호를 잊으면 복원할 수 없습니다.
 
 ---
 
@@ -139,9 +152,9 @@ Tauri と Vanilla JavaScript で作った **デスクトップ用 Todo・スト�
 | 機能 | 説明 |
 |------|------|
 | **Todo** | タスクの追加・完了トグル・削除、フィルター（全体/進行中/完了）、件数表示 |
-| **ストップウォッチ** | 開始/一時停止、ラップ記録、ラップごとの区間時間・削除、リセット。状態はアプリとともに保存 |
-| **統計** | 期間指定で日別・週間統計：完了/作成タスク数、フォーカス時間、ラップ数。Chart.js の棒・線グラフ、CSV エクスポート |
-| **バックアップ** | Tauri 環境のみ：暗号化 JSON でエクスポート・インポート（Todo + ストップウォッチ状態） |
+| **ストップウォッチ** | 開始/一時停止、ラップ記録、ラップごとの区間時間・削除、リセット。実行状態まで保存され、実行中にアプリを終了するとその時点で一時停止 |
+| **統計** | 期間指定で日別統計：完了/作成タスク数、集中時間（ストップウォッチのセッション記録）、ラップ数・平均ラップ時間。日付はローカルタイムゾーン基準で、削除したタスクも統計に残る。Chart.js の棒・線グラフ、CSV エクスポート |
+| **バックアップ** | Tauri 環境のみ：パスワードで暗号化した JSON でエクスポート・インポート（Todo + ストップウォッチ + 統計記録）。同じパスワードで別の PC でも復元可能 |
 | **リアルタイム時計** | ヘッダーに現在の曜日・時刻を表示 |
 
 - Tauri がない環境（例：ブラウザで `index.html` を直接開く場合）は **localStorage** で Todo・ストップウォッチ状態を保存します。バックアップや統計の一部は Tauri 専用です。
@@ -150,10 +163,10 @@ Tauri と Vanilla JavaScript で作った **デスクトップ用 Todo・スト�
 
 ### 技術スタック
 
-- **フロントエンド**: HTML5, CSS3, Vanilla JavaScript (ES Module), [Chart.js](https://www.chartjs.org/)（統計グラフ）
+- **フロントエンド**: HTML5, CSS3, Vanilla JavaScript (ES Module), [Chart.js](https://www.chartjs.org/)（統計グラフ。`src/vendor/` に同梱しオフラインでも動作）
 - **デスクトップ・バックエンド**: [Tauri v1](https://tauri.app/) (Rust)
-- **データ保存**: Rust 側で **AES-256-GCM** 暗号化のうえアプリデータディレクトリに保存。暗号鍵は OS キーチェーン(keyring)を優先、失敗時はローカル fallback ファイルを使用
-- **バックアップファイル**: エクスポート時は同一鍵で暗号化し、HMAC 署名で改ざん検証
+- **データ保存**: Rust 側で **AES-256-GCM** 暗号化のうえアプリデータディレクトリに保存。暗号鍵は同じディレクトリの `key_fallback.b64` を優先し（キーチェーンのパスワード入力を回避）、無ければ OS キーチェーン(keyring)から取得
+- **バックアップファイル**: ユーザーのパスワードから **Argon2id** で導出した鍵で AES-256-GCM 暗号化。旧形式（v1: 端末の鍵 + HMAC）のバックアップも作成した端末ではインポート可能
 
 ---
 
@@ -190,16 +203,22 @@ todo_app/
 │   ├── index.html            # 単一ページ: Todo、フィルター、ストップウォッチ、統計パネル
 │   ├── main.js               # Todo/ストップウォッチ/統計/バックアップの UI・ロジック、Tauri invoke
 │   ├── styles.css            # スタイル
+│   ├── vendor/chart.umd.js   # Chart.js 4.4.0（同梱。CSP で外部スクリプトを遮断）
 │   └── assets/               # 静的アセット
 ├── src-tauri/                # Tauri (Rust) アプリ
-│   ├── Cargo.toml            # Rust 依存関係（tauri, serde, aes-gcm, keyring, chrono 等）
+│   ├── Cargo.toml            # Rust 依存関係（tauri, serde, aes-gcm, argon2, keyring, chrono 等）
 │   ├── tauri.conf.json       # ウィンドウサイズ、identifier、許可 API 等
 │   ├── icons/
 │   └── src/
-│       ├── main.rs           # エントリポイント、Tauri commands: get_tasks, add_task, toggle_task,
-│       │                     # delete_task, get/set/clear_stopwatch_state, export_data,
-│       │                     # import_data, get_daily_stats, get_weekly_stats, export_stats_csv
-│       └── storage.rs        # AES-256-GCM 暗号化の保存/読み込み、キーチェーン・fallback 鍵、バックアップ出力/読み込み
+│       ├── main.rs           # エントリポイント、データモデル、統計、Tauri commands:
+│       │                     #   Todo: get_tasks, add_task, toggle_task, delete_task
+│       │                     #   ストップウォッチ: get_stopwatch_state, stopwatch_start/stop/lap/
+│       │                     #                     delete_lap/clear_laps/reset
+│       │                     #   バックアップ: export_data, backup_needs_password, import_data
+│       │                     #   統計: get_range_stats, export_stats_csv
+│       │                     #   その他: take_load_failure（起動時の読み込み失敗通知）
+│       ├── stopwatch.rs      # ストップウォッチの状態と集中セッション・ラップ記録
+│       └── storage.rs        # 暗号化保存/読み込み（アトミック書き込み）、鍵管理、バックアップ v1/v2
 ├── package.json              # scripts: tauri, tauri dev/build
 └── README.md
 ```
@@ -209,8 +228,15 @@ todo_app/
 ### データの保存場所（Tauri アプリ）
 
 - **アプリデータ**: OS ごとのアプリデータディレクトリ内の `app_data.enc.json`（暗号化 JSON）。
-- **暗号鍵**: OS キーチェーン（サービス名 = bundle identifier）または同一ディレクトリの `key_fallback.b64`。
-- **バックアップファイル**: ユーザーが指定したパスに保存される `.json`（同一形式・HMAC 署名付き）。
+- **暗号鍵**: 同一ディレクトリの `key_fallback.b64`。無ければ OS キーチェーン（サービス名 = bundle identifier）から取得してこのファイルに保存。
+- **バックアップファイル**: ユーザーが指定したパスに保存される `.json`（パスワードベースの暗号化）。
+- **保全ファイル**: 保存データを読み込めない場合は元ファイルを `app_data.enc.json.corrupt-<日時>` として、置き換えた鍵は `key_fallback.b64.old-<日時>` として削除せずに残す。
+
+#### 保護範囲
+
+- 暗号鍵がデータファイルと同じディレクトリにあるため、ローカル暗号化は**同じユーザーアカウントのプログラムからはデータを保護しません。**
+- その代わり macOS/Linux ではアプリデータディレクトリ（0700）とデータ・鍵ファイル（0600）を本人のアカウントのみアクセス可能にし、**他のユーザーアカウントから**保護します。Windows ではユーザーごとのアプリデータフォルダの権限に従います。
+- バックアップファイルはパスワードで暗号化されるため、鍵ファイルなしで単独で保管・移動できます。パスワードを忘れると復元できません。
 
 ---
 
