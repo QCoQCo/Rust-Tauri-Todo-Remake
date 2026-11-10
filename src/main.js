@@ -686,6 +686,7 @@ async function setupStats() {
     const chartTasksCanvas = document.getElementById('stats-chart-tasks');
     const chartFocusCanvas = document.getElementById('stats-chart-focus');
 
+    // 차트는 처음 조회할 때 한 번 만들고, 이후에는 데이터만 바꿔 update()
     let chartTasks = null;
     let chartFocus = null;
 
@@ -694,11 +695,92 @@ async function setupStats() {
         return;
     }
 
-    // Chart.js 기본 색상 설정
     const chartColors = {
         completed: 'rgba(124, 92, 255, 0.8)',
         created: 'rgba(47, 230, 199, 0.8)',
         focus: 'rgba(92, 124, 255, 0.8)',
+        focusFill: 'rgba(92, 124, 255, 0.1)',
+    };
+
+    // 두 차트가 함께 쓰는 어두운 테마 옵션 (호출마다 새 객체를 만들어 차트끼리 공유하지 않음)
+    const baseChartOptions = () => {
+        const axis = (extra = {}) => ({
+            ...extra,
+            ticks: { color: 'rgba(255, 255, 255, 0.6)', font: { size: 10 } },
+            grid: { color: 'rgba(255, 255, 255, 0.1)' },
+        });
+        return {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    labels: { color: 'rgba(255, 255, 255, 0.8)', font: { size: 11 } },
+                },
+            },
+            scales: {
+                y: axis({ beginAtZero: true }),
+                x: axis(),
+            },
+        };
+    };
+
+    const barDataset = (label, color) => ({
+        label,
+        data: [],
+        backgroundColor: color,
+        borderColor: color,
+        borderWidth: 1,
+    });
+
+    const createCharts = () => {
+        chartTasks = new Chart(chartTasksCanvas, {
+            type: 'bar',
+            data: {
+                labels: [],
+                datasets: [
+                    barDataset('완료된 할 일', chartColors.completed),
+                    barDataset('생성된 할 일', chartColors.created),
+                ],
+            },
+            options: baseChartOptions(),
+        });
+        chartFocus = new Chart(chartFocusCanvas, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: '집중 시간 (분)',
+                        data: [],
+                        borderColor: chartColors.focus,
+                        backgroundColor: chartColors.focusFill,
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4,
+                    },
+                ],
+            },
+            options: baseChartOptions(),
+        });
+    };
+
+    const updateCharts = (dailyStats) => {
+        if (!chartTasks) createCharts();
+
+        const labels = dailyStats.map((s) => {
+            const [, m, d] = s.date.split('-').map(Number);
+            return `${m}/${d}`;
+        });
+
+        chartTasks.data.labels = labels;
+        chartTasks.data.datasets[0].data = dailyStats.map((s) => s.tasks_completed || 0);
+        chartTasks.data.datasets[1].data = dailyStats.map((s) => s.tasks_created || 0);
+        chartTasks.update();
+
+        chartFocus.data.labels = labels;
+        // 분 단위
+        chartFocus.data.datasets[0].data = dailyStats.map((s) => Math.floor((s.focus_time_ms || 0) / 60000));
+        chartFocus.update();
     };
 
     // 기본 범위: 오늘 포함 최근 7일
@@ -736,8 +818,6 @@ async function setupStats() {
                 { start_date: startDate, end_date: endDate },
                 async () => emptyRangeStats(startDate, endDate),
             );
-            const dailyStats = stats.daily_stats;
-
             // UI 업데이트
             document.getElementById('stat-completed').textContent = String(stats.total_tasks_completed);
             document.getElementById('stat-created').textContent = String(stats.total_tasks_created);
@@ -745,133 +825,11 @@ async function setupStats() {
             document.getElementById('stat-avg-lap').textContent =
                 stats.avg_lap_time_ms == null ? '-' : `${formatMsToSec(stats.avg_lap_time_ms)}초`;
 
-            // 차트 데이터 준비
-            const labels = dailyStats.map((s) => {
-                const [, m, d] = s.date.split('-').map(Number);
-                return `${m}/${d}`;
-            });
-            const completedData = dailyStats.map((s) => s.tasks_completed || 0);
-            const createdData = dailyStats.map((s) => s.tasks_created || 0);
-            const focusData = dailyStats.map((s) => Math.floor((s.focus_time_ms || 0) / 60000)); // 분 단위
-
-            // 할 일 차트 (Bar)
-            if (chartTasks) {
-                chartTasks.destroy();
-            }
-            chartTasks = new Chart(chartTasksCanvas, {
-                type: 'bar',
-                data: {
-                    labels,
-                    datasets: [
-                        {
-                            label: '완료된 할 일',
-                            data: completedData,
-                            backgroundColor: chartColors.completed,
-                            borderColor: chartColors.completed,
-                            borderWidth: 1,
-                        },
-                        {
-                            label: '생성된 할 일',
-                            data: createdData,
-                            backgroundColor: chartColors.created,
-                            borderColor: chartColors.created,
-                            borderWidth: 1,
-                        },
-                    ],
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            labels: {
-                                color: 'rgba(255, 255, 255, 0.8)',
-                                font: { size: 11 },
-                            },
-                        },
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            ticks: {
-                                color: 'rgba(255, 255, 255, 0.6)',
-                                font: { size: 10 },
-                            },
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.1)',
-                            },
-                        },
-                        x: {
-                            ticks: {
-                                color: 'rgba(255, 255, 255, 0.6)',
-                                font: { size: 10 },
-                            },
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.1)',
-                            },
-                        },
-                    },
-                },
-            });
-
-            // 집중 시간 차트 (Line)
-            if (chartFocus) {
-                chartFocus.destroy();
-            }
-            chartFocus = new Chart(chartFocusCanvas, {
-                type: 'line',
-                data: {
-                    labels,
-                    datasets: [
-                        {
-                            label: '집중 시간 (분)',
-                            data: focusData,
-                            borderColor: chartColors.focus,
-                            backgroundColor: 'rgba(92, 124, 255, 0.1)',
-                            borderWidth: 2,
-                            fill: true,
-                            tension: 0.4,
-                        },
-                    ],
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            labels: {
-                                color: 'rgba(255, 255, 255, 0.8)',
-                                font: { size: 11 },
-                            },
-                        },
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            ticks: {
-                                color: 'rgba(255, 255, 255, 0.6)',
-                                font: { size: 10 },
-                            },
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.1)',
-                            },
-                        },
-                        x: {
-                            ticks: {
-                                color: 'rgba(255, 255, 255, 0.6)',
-                                font: { size: 10 },
-                            },
-                            grid: {
-                                color: 'rgba(255, 255, 255, 0.1)',
-                            },
-                        },
-                    },
-                },
-            });
-
+            // 캔버스 크기가 잡히도록 먼저 보이게 한 뒤 차트를 그림
             content.querySelector('.stats-grid').hidden = false;
             content.querySelector('.stats-charts').hidden = false;
             empty.hidden = true;
+            updateCharts(stats.daily_stats);
         } catch (e) {
             window.alert(`통계 조회 실패: ${e}`);
             console.error(e);
