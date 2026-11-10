@@ -124,24 +124,39 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn persist(app: &tauri::AppHandle, data: &AppData) {
-    match serde_json::to_vec(data) {
-        Ok(bytes) => {
-            if let Err(e) = storage::save_encrypted(app, &bytes) {
-                eprintln!("persist failed: {e}");
-            }
-        }
-        Err(e) => eprintln!("persist serialize failed: {e}"),
+fn persist(app: &tauri::AppHandle, data: &AppData) -> Result<(), String> {
+    let bytes = serde_json::to_vec(data).map_err(|e| format!("serialize error: {e}"))?;
+    storage::save_encrypted(app, &bytes).map_err(|e| format!("failed to save data: {e}"))
+}
+
+/// 체크포인트·종료·시작 시 복구처럼 알릴 화면이 없는 저장: 실패는 기록만 남김
+fn persist_or_log(app: &tauri::AppHandle, data: &AppData) {
+    if let Err(e) = persist(app, data) {
+        eprintln!("persist failed: {e}");
     }
 }
 
+/// 변경을 적용하고 저장한다. 저장에 실패하면 변경 전 상태로 되돌리고 에러를 돌려준다
+/// (화면에는 실패로 보이는데 메모리에만 변경이 남아 있다가 다음 저장 때 반영되는 일이 없도록)
+fn apply_and_save<R>(
+    data: &mut AppData,
+    f: impl FnOnce(&mut AppData) -> R,
+    save: impl FnOnce(&AppData) -> Result<(), String>,
+) -> Result<R, String> {
+    let before = data.clone();
+    let out = f(data);
+    if let Err(e) = save(data) {
+        *data = before;
+        return Err(e);
+    }
+    Ok(out)
+}
+
 /// 상태를 바꾸고 저장한다. 저장 순서가 뒤바뀌지 않도록 잠금을 쥔 채로 저장
-fn update<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut AppData) -> R) -> R {
+fn update<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut AppData) -> R) -> Result<R, String> {
     let state = app.state::<AppState>();
     let mut data = state.0.lock().unwrap();
-    let out = f(&mut data);
-    persist(app, &data);
-    out
+    apply_and_save(&mut data, f, |d| persist(app, d))
 }
 
 #[tauri::command]
@@ -177,7 +192,7 @@ fn next_task_id(tasks: &[TodoItem], now_ms: u64) -> u64 {
 #[tauri::command]
 fn add_task(text: String, app: tauri::AppHandle) -> Result<Vec<TodoItem>, String> {
     let text = validate_task_text(&text)?;
-    Ok(update(&app, |data| {
+    update(&app, |data| {
         let item = TodoItem {
             id: next_task_id(&data.tasks, now_millis()),
             text,
@@ -189,11 +204,11 @@ fn add_task(text: String, app: tauri::AppHandle) -> Result<Vec<TodoItem>, String
         // 최신이 위로
         data.tasks.insert(0, item);
         data.visible_tasks()
-    }))
+    })
 }
 
 #[tauri::command]
-fn toggle_task(id: u64, app: tauri::AppHandle) -> Vec<TodoItem> {
+fn toggle_task(id: u64, app: tauri::AppHandle) -> Result<Vec<TodoItem>, String> {
     update(&app, |data| {
         if let Some(t) = data.tasks.iter_mut().find(|t| t.id == id && t.deleted_at.is_none()) {
             t.completed = !t.completed;
@@ -204,7 +219,7 @@ fn toggle_task(id: u64, app: tauri::AppHandle) -> Vec<TodoItem> {
 }
 
 #[tauri::command]
-fn delete_task(id: u64, app: tauri::AppHandle) -> Vec<TodoItem> {
+fn delete_task(id: u64, app: tauri::AppHandle) -> Result<Vec<TodoItem>, String> {
     update(&app, |data| {
         if let Some(t) = data.tasks.iter_mut().find(|t| t.id == id && t.deleted_at.is_none()) {
             t.deleted_at = Some(now_secs());
@@ -219,7 +234,7 @@ fn get_stopwatch_state(state: tauri::State<'_, AppState>) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_start(app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_start(app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         data.with_stopwatch(|sw| sw.start(now_millis()));
         data.stopwatch_view()
@@ -227,7 +242,7 @@ fn stopwatch_start(app: tauri::AppHandle) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_stop(app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_stop(app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         data.stop_stopwatch(now_millis());
         data.stopwatch_view()
@@ -235,7 +250,7 @@ fn stopwatch_stop(app: tauri::AppHandle) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_lap(app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_lap(app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         if let Some(lap) = data.with_stopwatch(|sw| sw.lap(now_millis())) {
             data.lap_records.push(lap);
@@ -245,7 +260,7 @@ fn stopwatch_lap(app: tauri::AppHandle) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_delete_lap(index: usize, app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_delete_lap(index: usize, app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         data.with_stopwatch(|sw| sw.delete_lap(index));
         data.stopwatch_view()
@@ -253,7 +268,7 @@ fn stopwatch_delete_lap(index: usize, app: tauri::AppHandle) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_clear_laps(app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_clear_laps(app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         data.with_stopwatch(|sw| sw.clear_laps());
         data.stopwatch_view()
@@ -261,7 +276,7 @@ fn stopwatch_clear_laps(app: tauri::AppHandle) -> StopwatchState {
 }
 
 #[tauri::command]
-fn stopwatch_reset(app: tauri::AppHandle) -> StopwatchState {
+fn stopwatch_reset(app: tauri::AppHandle) -> Result<StopwatchState, String> {
     update(&app, |data| {
         data.reset_stopwatch(now_millis());
         data.stopwatch_view()
@@ -301,14 +316,14 @@ async fn import_data(
     // 실행 중에 내보낸 백업이면 내보낸 시점 근처(체크포인트)에서 멈춘 것으로 처리
     imported.recover_interrupted_stopwatch(now_millis());
 
-    // 상태를 교체하고 즉시 저장
-    Ok(update(&app, |data| {
+    // 상태를 교체하고 즉시 저장 (저장에 실패하면 기존 상태 유지)
+    update(&app, |data| {
         *data = imported;
         AppView {
             tasks: data.visible_tasks(),
             stopwatch: data.stopwatch_view(),
         }
-    }))
+    })
 }
 
 // --- 통계 관련 구조체 ---
@@ -477,7 +492,7 @@ fn spawn_checkpoint_thread(app: tauri::AppHandle) {
         let mut data = state.0.lock().unwrap();
         let now = now_millis();
         if data.stopwatch.as_mut().is_some_and(|sw| sw.checkpoint(now)) {
-            persist(&app, &data);
+            persist_or_log(&app, &data);
         }
     });
 }
@@ -502,7 +517,7 @@ fn main() {
                     // 지난번에 비정상 종료됐다면 실행 중이던 스탑워치를 마지막 체크포인트에서 멈춤
                     let recovered = data.recover_interrupted_stopwatch(now_millis());
                     if recovered {
-                        persist(&handle, &data);
+                        persist_or_log(&handle, &data);
                     }
                     let state = app.state::<AppState>();
                     let mut guard = state.0.lock().unwrap();
@@ -560,7 +575,7 @@ fn main() {
             let mut data = state.0.lock().unwrap();
             if data.stopwatch.as_ref().is_some_and(StopwatchState::is_running) {
                 data.stop_stopwatch(now_millis());
-                persist(app, &data);
+                persist_or_log(app, &data);
             }
         }
     });
@@ -740,6 +755,22 @@ mod tests {
         // 시계가 뒤로 간 경우 / 가져온 데이터의 id가 더 큰 경우
         assert_eq!(next_task_id(&tasks, 500), 1_001);
         assert_eq!(next_task_id(&tasks, 2_000), 2_000);
+    }
+
+    #[test]
+    fn failed_save_rolls_back_the_change() {
+        let mut data = AppData { tasks: vec![task(1, None)], ..AppData::default() };
+
+        let err = apply_and_save(&mut data, |d| d.tasks.clear(), |_| Err("disk full".to_string())).unwrap_err();
+        assert_eq!(err, "disk full");
+        assert_eq!(data.tasks.len(), 1, "memory must match what is on disk");
+
+        let saved = apply_and_save(&mut data, |d| { d.tasks.clear(); 42 }, |d| {
+            assert!(d.tasks.is_empty(), "save sees the new state");
+            Ok(())
+        });
+        assert_eq!(saved, Ok(42));
+        assert!(data.tasks.is_empty());
     }
 
     #[test]
